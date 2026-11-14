@@ -1,0 +1,606 @@
+import { countAiMessages_ACU, resolveGeneratedAiMessageIndex_ACU, type AutoFillIntent_ACU } from '../runtime/message-handler';
+import { validateLoopTags_ACU } from '../loop/loop-evaluator';
+import { countAgentTokens_ACU } from './agent/agent-token-budget';
+import { logAgentSession_ACU } from './agent/agent-session-log';
+import { resolveHostRetryMode_ACU } from './host-retry-mode';
+import type { ContinuationPreparedTurnInstruction_ACU } from './stage-execution-engine';
+import type { ContinuationHostGenerationCapture_ACU, TurnAttemptIdentity_ACU } from './model';
+import type { ContinuationHostTurnAdapter_ACU } from './host-turn-adapter';
+import { getContinuationGenerationDebug_ACU, continuationDebugErrorType_ACU, type ContinuationGenerationDebug_ACU } from './generation-debug';
+
+export interface ContinuationHostTurnRuntime_ACU {
+  getChatIdentity(): string;
+  getChat(): any[];
+  getGenerationSequence(): number;
+  retryCurrentTurn(): Promise<{ retryHostGeneration?: boolean }>;
+  readPendingHostTurn(): { settings: { loopTags: string; retryDelaySeconds?: number; minGenerationTokens?: number }; pending: { identity: TurnAttemptIdentity_ACU; capture: ContinuationHostGenerationCapture_ACU; status: 'awaiting_generation' | 'retry_ready' | 'exhausted' } } | null;
+  readAutoContinueState(): { eligible: boolean; delaySeconds: number };
+  continueTask(): Promise<{ preparedTurn?: ContinuationPreparedTurnInstruction_ACU; retryHostGeneration?: boolean }>;
+  recordHostTurn(input: { capture: ContinuationHostGenerationCapture_ACU }): Promise<unknown>;
+  bindHostTurnGeneration(generationSeq: number): Promise<void>;
+  redirectHostTurnGeneration(input: { attemptId: string; generationSeq: number | null }): Promise<void>;
+  confirmCurrentTurn(messageIndex?: number): Promise<unknown>;
+  rejectHostTurnForMissingTags(input: { messageIndex: number }): Promise<unknown>;
+  rejectHostTurnForShortGeneration(input: { messageIndex: number; tokenCount: number; threshold: number }): Promise<unknown>;
+  rejectHostTurnForFailedGeneration(): Promise<unknown>;
+  pauseForHostInputFailure(): Promise<unknown>;
+  pauseForHostResultFailure(): Promise<unknown>;
+  failHostTurnForStoppedGeneration(): Promise<unknown>;
+}
+
+export interface ContinuationHostGenerationEventContext_ACU {
+  allowOrdinaryLooseClaim: boolean;
+  automaticTrigger: boolean;
+  quietLike: boolean;
+  dryRun: boolean;
+}
+
+type ContinuationHostGenerationEventContextInput_ACU = ContinuationHostGenerationEventContext_ACU | boolean | undefined;
+
+function normalizeGenerationEventContext_ACU(input: ContinuationHostGenerationEventContextInput_ACU): ContinuationHostGenerationEventContext_ACU {
+  if (typeof input === 'boolean') return { allowOrdinaryLooseClaim: input, automaticTrigger: false, quietLike: false, dryRun: false };
+  return input ?? { allowOrdinaryLooseClaim: false, automaticTrigger: false, quietLike: false, dryRun: false };
+}
+
+export interface ContinuationHostGenerationBridgeDependencies_ACU {
+  runtime: ContinuationHostTurnRuntime_ACU;
+  hostInput: ContinuationHostTurnAdapter_ACU;
+  now(): number;
+  wait(ms: number): Promise<void>;
+  materializationRetries: number;
+  materializationRetryDelayMs: number;
+  countTokens?: (text: string) => Promise<number>;
+}
+
+type StartedHostGeneration_ACU = { attemptId: string; sequence: number; bind: Promise<void> };
+type LocalRetryClaim_ACU = { attemptId: string; mode: 'generate' | 'regenerate'; createdAt: number; sequence: number | null; consumed: boolean };
+type RedirectClaim_ACU = { attemptId: string; sourceSequence: number | null; phase: 'preparing' | 'waiting' | 'resuming'; completionStarted: boolean };
+
+/** 发送前接管持有的单轮交接；停止或切换聊天后不再启动迟到的正文请求。 */
+export interface ContinuationHostGenerationRedirect_ACU {
+  resume(generate: () => Promise<unknown>): Promise<void>;
+  cancel(): Promise<void>;
+}
+
+/**
+ * The only bridge that may couple a prepared continuation turn to host input
+ * and GENERATION_* events.
+ *
+ * 认领采用两层判定：
+ * - 严格层：GENERATION_STARTED 在发送的同步窗口内到达时按序列号精确配对（历史行为）。
+ * - 宽松层：参考最原始智能续写的状态法——持久化的 pendingHostTurn（awaiting_generation）
+ *   就是"正在等待回复"的标志，任意非 quiet 的生成事件（由调用方经 allowLoose 过滤后）
+ *   都可被认领；归属安全交给 resolveGeneratedAiMessageIndex_ACU 的唯一候选解析兜底。
+ *   宿主的 GENERATION_STARTED 通常在点击发送后的微任务中才送达，严格层此时必然错过，
+ *   没有宽松层就会永远收不到正文完成信号。
+ */
+export class ContinuationHostGenerationBridge_ACU {
+  private sendingAttemptId: string | null = null;
+  /** 点击已返回但宿主尚未派发开始事件；不用于放宽事件认领条件。 */
+  private readonly dispatchedByChat = new Map<string, string>();
+  private readonly startedByChat = new Map<string, StartedHostGeneration_ACU>();
+  private readonly redirectsByChat = new Map<string, RedirectClaim_ACU>();
+  private readonly stateListeners = new Set<() => void>();
+  private localRetryClaim: LocalRetryClaim_ACU | null = null;
+  private readonly debugByChat = new Map<string, { attemptId: string; trace: ContinuationGenerationDebug_ACU }>();
+  private static readonly LOCAL_RETRY_CLAIM_TTL_MS = 60_000;
+
+  constructor(private readonly dependencies: ContinuationHostGenerationBridgeDependencies_ACU) {}
+
+  /** 订阅桥驱动的持久化状态变更；页面无需猜测宿主事件何时完成。 */
+  subscribeStateChanges(listener: () => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
+  private notifyStateChanges_ACU(): void {
+    for (const listener of this.stateListeners) {
+      try { listener(); } catch { /* 观察者失败不能影响正文确认链 */ }
+    }
+  }
+
+  /** 只返回当前等待轮的观察器；调用者可记录阶段，不取得任务写权限。 */
+  captureGenerationDebug(sequence?: number): ContinuationGenerationDebug_ACU | undefined {
+    try {
+      const runtime = this.dependencies.runtime;
+      const chatIdentity = runtime.getChatIdentity();
+      const record = this.debugByChat.get(chatIdentity);
+      const pending = runtime.readPendingHostTurn()?.pending;
+      if (!record || pending?.identity.attemptId !== record.attemptId || pending.status !== 'awaiting_generation') return;
+      const bound = this.startedByChat.get(chatIdentity)?.sequence ?? pending.capture.generationSeq;
+      if (sequence !== undefined && sequence !== bound) return;
+      return record.trace;
+    } catch { /* 观察失败不能改变事件处理 */ }
+  }
+
+  disposeDiagnostics(): void {
+    for (const record of this.debugByChat.values()) record.trace.cancel();
+    this.debugByChat.clear();
+  }
+
+  /** 打断酒馆正在进行的正文生成。用户点停止时必须先走这里，否则正文写完仍会确认并自动续写。 */
+  stopHostGeneration(): void {
+    this.captureGenerationDebug()?.finish('stopped', { reason: 'user_stopped' });
+    this.dependencies.hostInput.stopGeneration();
+  }
+
+  /** 活认领覆盖同步发送、异步交接与生成开始；重建桥后仍按滞留态恢复。 */
+  hasLiveClaim(chatIdentity: string): boolean {
+    const runtime = this.dependencies.runtime;
+    const pending = runtime.readPendingHostTurn()?.pending;
+    if (runtime.getChatIdentity() !== chatIdentity || pending?.status !== 'awaiting_generation'
+      || pending.identity.chatIdentity !== chatIdentity) {
+      this.dispatchedByChat.delete(chatIdentity);
+      return false;
+    }
+    const dispatched = this.dispatchedByChat.get(chatIdentity);
+    if (dispatched !== undefined && dispatched !== pending.identity.attemptId) {
+      this.dispatchedByChat.delete(chatIdentity);
+    }
+    if (this.sendingAttemptId === pending.identity.attemptId
+      || dispatched === pending.identity.attemptId) {
+      return true;
+    }
+    const redirect = this.redirectsByChat.get(chatIdentity);
+    if (redirect && this.isCurrentRedirect_ACU(chatIdentity, redirect)) return true;
+    return this.startedByChat.get(chatIdentity)?.attemptId === pending.identity.attemptId;
+  }
+
+  /** 明确认领发送前处理的替代请求，不把任意新生成当作原轮次的延续。 */
+  async prepareHostGenerationRedirect(sourceSequence: number | undefined): Promise<ContinuationHostGenerationRedirect_ACU | null> {
+    const runtime = this.dependencies.runtime;
+    const chatIdentity = runtime.getChatIdentity();
+    const snapshot = runtime.readPendingHostTurn();
+    if (!snapshot || snapshot.pending.status !== 'awaiting_generation' || snapshot.pending.identity.chatIdentity !== chatIdentity) return null;
+    const started = this.startedByChat.get(chatIdentity);
+    const boundSequence = started?.sequence ?? snapshot.pending.capture.generationSeq;
+    if (sourceSequence !== undefined && boundSequence !== null && sourceSequence !== boundSequence) return null;
+    if (this.redirectsByChat.has(chatIdentity)) return null;
+    const claim: RedirectClaim_ACU = { attemptId: snapshot.pending.identity.attemptId, sourceSequence: sourceSequence ?? boundSequence, phase: 'preparing', completionStarted: false };
+    // 在首次 await 前屏蔽原请求的终态和处理期间的内部生成。
+    this.redirectsByChat.set(chatIdentity, claim);
+    this.dispatchedByChat.delete(chatIdentity);
+    const handoff: ContinuationHostGenerationRedirect_ACU = {
+      resume: async generate => {
+        if (!this.isCurrentRedirect_ACU(chatIdentity, claim)) {
+          this.releaseRedirect_ACU(chatIdentity, claim);
+          return;
+        }
+        if (claim.phase !== 'waiting') return;
+        claim.phase = 'resuming';
+        try {
+          await generate();
+        } finally {
+          // 宿主生成 Promise 已结束但未派发终态时，仍走同一正文解析/空回重试链。
+          // 已开始消费的原生回调独占结算，避免同一轮被确认或重试两次。
+          try {
+            if (!claim.completionStarted && this.isCurrentRedirect_ACU(chatIdentity, claim)) {
+              const sequence = this.startedByChat.get(chatIdentity)?.sequence ?? runtime.readPendingHostTurn()?.pending.capture.generationSeq ?? undefined;
+              await this.onGenerationEnded(undefined, sequence, true);
+            }
+          } finally {
+            // 原生终态回调仍在处理中时，由该回调负责释放交接。
+            if (!claim.completionStarted) this.releaseRedirect_ACU(chatIdentity, claim);
+          }
+        }
+      },
+      cancel: async () => {
+        if (!this.isCurrentRedirect_ACU(chatIdentity, claim)) {
+          this.releaseRedirect_ACU(chatIdentity, claim);
+          return;
+        }
+        this.startedByChat.delete(chatIdentity);
+        try { await runtime.failHostTurnForStoppedGeneration(); }
+        finally {
+          this.releaseRedirect_ACU(chatIdentity, claim);
+          this.notifyStateChanges_ACU();
+        }
+      },
+    };
+    try {
+      if (started) await started.bind;
+      if (!this.isCurrentRedirect_ACU(chatIdentity, claim)) return handoff;
+      const pending = runtime.readPendingHostTurn()!.pending;
+      await runtime.redirectHostTurnGeneration({ attemptId: claim.attemptId, generationSeq: pending.capture.generationSeq });
+      this.startedByChat.delete(chatIdentity);
+      claim.phase = 'waiting';
+      this.notifyStateChanges_ACU();
+    } catch {
+      if (this.isCurrentRedirect_ACU(chatIdentity, claim)) {
+        try { await runtime.pauseForHostResultFailure(); } catch { /* 保留原持久化失败。 */ }
+      }
+      this.releaseRedirect_ACU(chatIdentity, claim);
+      this.notifyStateChanges_ACU();
+    }
+    return handoff;
+  }
+
+  private isCurrentRedirect_ACU(chatIdentity: string, claim: RedirectClaim_ACU): boolean {
+    const runtime = this.dependencies.runtime;
+    if (runtime.getChatIdentity() !== chatIdentity || this.redirectsByChat.get(chatIdentity) !== claim) return false;
+    const pending = runtime.readPendingHostTurn()?.pending;
+    return pending?.status === 'awaiting_generation' && pending.identity.chatIdentity === chatIdentity && pending.identity.attemptId === claim.attemptId;
+  }
+
+  private releaseRedirect_ACU(chatIdentity: string, claim: RedirectClaim_ACU): void {
+    if (this.redirectsByChat.get(chatIdentity) === claim) this.redirectsByChat.delete(chatIdentity);
+  }
+
+  async send(prepared: ContinuationPreparedTurnInstruction_ACU): Promise<boolean> {
+    const runtime = this.dependencies.runtime;
+    const debug = getContinuationGenerationDebug_ACU(prepared);
+    debug.step('bridge_entered', { mode: 'host', chars: prepared.instruction.instruction.length });
+    if (prepared.identity.chatIdentity !== runtime.getChatIdentity()) {
+      debug.finish('failed', { reason: 'chat_mismatch' }, false);
+      return false;
+    }
+    const chatIdentity = prepared.identity.chatIdentity;
+    const chat = runtime.getChat();
+    const capture: ContinuationHostGenerationCapture_ACU = {
+      capturedAt: this.dependencies.now(),
+      capturedChatLength: Array.isArray(chat) ? chat.length : 0,
+      capturedAiFloorCount: Array.isArray(chat) ? chat.filter(message => message && !message.is_user && message?.extra?.type !== 'narrator').length : 0,
+      generationSeq: null,
+    };
+    debug.step('host_turn_recording');
+    debug.watch(() => runtime.getChatIdentity() === chatIdentity);
+    try { await runtime.recordHostTurn({ capture }); }
+    catch (error) {
+      debug.finish('failed', { reason: 'exception', errorType: continuationDebugErrorType_ACU(error) }, false);
+      throw error;
+    }
+    const snapshot = runtime.readPendingHostTurn();
+    if (!snapshot) { debug.finish('failed', { reason: 'snapshot_missing' }, false); return false; }
+    this.debugByChat.get(chatIdentity)?.trace.cancel();
+    this.debugByChat.set(chatIdentity, { attemptId: snapshot.pending.identity.attemptId, trace: debug });
+    debug.setScope(() => runtime.getChatIdentity() === chatIdentity && this.debugByChat.get(chatIdentity)?.trace === debug);
+    debug.step('host_turn_recorded');
+    debug.watch(() => runtime.getChatIdentity() === chatIdentity
+      && runtime.readPendingHostTurn()?.pending.identity.attemptId === snapshot.pending.identity.attemptId);
+    this.sendingAttemptId = snapshot.pending.identity.attemptId;
+    this.dispatchedByChat.set(prepared.identity.chatIdentity, snapshot.pending.identity.attemptId);
+    this.notifyStateChanges_ACU();
+    try {
+      if (!this.dependencies.hostInput.send(prepared.instruction.instruction, debug)) {
+        debug.finish('failed', { reason: 'input_unavailable' }, false);
+        this.dispatchedByChat.delete(prepared.identity.chatIdentity);
+        await runtime.pauseForHostInputFailure();
+        return false;
+      }
+      return true;
+    } catch (error) {
+      debug.finish('failed', { reason: 'exception', errorType: continuationDebugErrorType_ACU(error) }, false);
+      throw error;
+    } finally {
+      this.sendingAttemptId = null;
+    }
+  }
+
+  /**
+   * 认领宿主生成开始事件。
+   * 严格路径：发送同步窗口内到达（sendingAttemptId 仍在）按历史行为配对。
+   * 宽松路径（allowLoose，调用方已过滤 quiet/dryRun/automatic）：当前聊天存在未绑定
+   * 序列号的等待轮时认领——宿主事件通常在发送返回后的微任务里才送达，没有这条路径
+   * 生成开始永远配对不上（spv8.9.2 时代的状态法没有这个问题）。
+   */
+  onGenerationStarted(sequence: number, contextInput: ContinuationHostGenerationEventContextInput_ACU = undefined): boolean {
+    const context = normalizeGenerationEventContext_ACU(contextInput);
+    const runtime = this.dependencies.runtime;
+    const chatIdentity = runtime.getChatIdentity();
+    const redirect = this.redirectsByChat.get(chatIdentity);
+    const debug = this.captureGenerationDebug();
+    const ignored = (reason: string): false => {
+      debug?.step('generation_ignored', { reason, seq: sequence, quietLike: context.quietLike,
+        dryRun: context.dryRun, automatic: context.automaticTrigger });
+      return false;
+    };
+    if (redirect && (redirect.completionStarted || redirect.phase !== 'resuming' || !this.isCurrentRedirect_ACU(chatIdentity, redirect) || context.quietLike || context.dryRun || sequence === redirect.sourceSequence)) return ignored('event_filtered');
+    const sendingAttemptId = this.sendingAttemptId;
+    if (sendingAttemptId) {
+      const snapshot = runtime.readPendingHostTurn();
+      if (!snapshot || snapshot.pending.identity.attemptId !== sendingAttemptId || snapshot.pending.capture.generationSeq !== null) return ignored('pending_snapshot');
+      this.startedByChat.set(chatIdentity, { attemptId: sendingAttemptId, sequence, bind: runtime.bindHostTurnGeneration(sequence) });
+      this.observeStartedBinding_ACU(chatIdentity, sequence);
+      this.dispatchedByChat.delete(chatIdentity);
+      if (this.localRetryClaim?.attemptId === sendingAttemptId) this.localRetryClaim = null;
+      this.notifyStateChanges_ACU();
+      return true;
+    }
+    const localRetryClaim = this.getMatchingLocalRetryClaim_ACU(context, sequence);
+    if (!context.allowOrdinaryLooseClaim && !localRetryClaim) return ignored('event_filtered');
+    if (this.startedByChat.has(chatIdentity)) return ignored('sequence_conflict');
+    const snapshot = runtime.readPendingHostTurn();
+    if (!snapshot || snapshot.pending.status !== 'awaiting_generation' || snapshot.pending.capture.generationSeq !== null) return ignored('pending_snapshot');
+    const attemptId = snapshot.pending.identity.attemptId;
+    if (localRetryClaim && attemptId !== localRetryClaim.attemptId) return ignored('pending_snapshot');
+    this.startedByChat.set(chatIdentity, { attemptId, sequence, bind: runtime.bindHostTurnGeneration(sequence) });
+    this.observeStartedBinding_ACU(chatIdentity, sequence);
+    this.dispatchedByChat.delete(chatIdentity);
+    if (localRetryClaim) this.localRetryClaim = null;
+    this.notifyStateChanges_ACU();
+    return true;
+  }
+
+  private observeStartedBinding_ACU(chatIdentity: string, sequence: number): void {
+    const started = this.startedByChat.get(chatIdentity);
+    const debug = this.captureGenerationDebug(sequence);
+    debug?.step('generation_started', { seq: sequence, claimed: true });
+    debug?.watch(() => this.dependencies.runtime.getChatIdentity() === chatIdentity
+      && this.dependencies.runtime.readPendingHostTurn()?.pending.identity.attemptId === started?.attemptId);
+    // 旁路观察原 Promise；结束事件仍等待原绑定结果并执行既有失败处理。
+    void started?.bind.catch(error => debug?.finish('binding_failed', {
+      errorType: continuationDebugErrorType_ACU(error), seq: sequence,
+    }, false));
+  }
+
+  /**
+   * 是否认领本次生成结束。严格路径按已认领的序列号精确匹配；
+   * 宽松路径（allowLoose）参考 spv8.9.2 的状态法：只要当前聊天有等待中的宿主轮
+   * 且序列号不冲突（未绑定或一致）就认领，归属由唯一候选解析器兜底。
+   */
+  claimsGenerationEnded(sequence: number | undefined, contextInput: ContinuationHostGenerationEventContextInput_ACU = undefined): boolean {
+    const context = normalizeGenerationEventContext_ACU(contextInput);
+    const runtime = this.dependencies.runtime;
+    const started = this.startedByChat.get(runtime.getChatIdentity());
+    const redirect = this.redirectsByChat.get(runtime.getChatIdentity());
+    if (redirect && (redirect.completionStarted || redirect.phase !== 'resuming' || sequence === redirect.sourceSequence)) return false;
+    if (started && sequence !== undefined && started.sequence === sequence) return true;
+    const localRetryClaim = this.getMatchingLocalRetryClaim_ACU(context, sequence);
+    if (!context.allowOrdinaryLooseClaim && !localRetryClaim) return false;
+    const snapshot = runtime.readPendingHostTurn();
+    if (!snapshot || snapshot.pending.status !== 'awaiting_generation') return false;
+    if (localRetryClaim && snapshot.pending.identity.attemptId !== localRetryClaim.attemptId) return false;
+    const boundSequence = snapshot.pending.capture.generationSeq ?? started?.sequence ?? null;
+    return boundSequence === null || sequence === undefined || boundSequence === sequence;
+  }
+
+  async onGenerationEnded(eventMessageId: unknown, sequence: number | undefined, contextInput: ContinuationHostGenerationEventContextInput_ACU = undefined): Promise<void> {
+    const context = normalizeGenerationEventContext_ACU(contextInput);
+    const endedOnlyLocalRetryClaim = this.getMatchingLocalRetryClaim_ACU(context, sequence);
+    const debug = this.captureGenerationDebug(sequence);
+    if (!this.claimsGenerationEnded(sequence, context)) {
+      debug?.step('generation_ignored', { seq: sequence, claimed: false, reason: 'event_filtered' });
+      return;
+    }
+    debug?.step('ended_signal', { seq: sequence, claimed: true });
+    const chatIdentity = this.dependencies.runtime.getChatIdentity();
+    const redirect = this.redirectsByChat.get(chatIdentity);
+    if (redirect) redirect.completionStarted = true;
+    const started = this.startedByChat.get(chatIdentity) ?? null;
+    this.startedByChat.delete(chatIdentity);
+    this.dispatchedByChat.delete(chatIdentity);
+    if (endedOnlyLocalRetryClaim) {
+      endedOnlyLocalRetryClaim.consumed = true;
+      this.localRetryClaim = null;
+    }
+    // 宽松路径没有 started 记录：身份以持久化等待轮为准。
+    const claimedAttemptId = started?.attemptId ?? this.dependencies.runtime.readPendingHostTurn()?.pending.identity.attemptId;
+    if (!claimedAttemptId) return;
+    try {
+      if (started) await started.bind;
+      const snapshot = this.dependencies.runtime.readPendingHostTurn();
+      if (!snapshot || snapshot.pending.status !== 'awaiting_generation' || snapshot.pending.identity.attemptId !== claimedAttemptId) {
+        debug?.finish('result_rejected', { reason: 'pending_snapshot' }, false);
+        return;
+      }
+      const boundSequence = snapshot.pending.capture.generationSeq;
+      if (boundSequence !== null && sequence !== undefined && boundSequence !== sequence) {
+        debug?.finish('result_rejected', { reason: 'sequence_conflict', seq: sequence }, false);
+        return;
+      }
+      const resolution = await this.resolveMessageIndex_ACU(eventMessageId, snapshot.pending.capture, chatIdentity);
+      if (resolution.kind === 'no_reply') {
+        debug?.finish('result_rejected', { reason: 'no_reply' }, false);
+        // 生成失败/未产出正文：没有新楼层，走酒馆 Generate 对已有用户楼要回复，不重跑 Agent。
+        await this.dependencies.runtime.rejectHostTurnForFailedGeneration();
+        await this.autoRetryHostGenerationIfReady_ACU(snapshot.settings.retryDelaySeconds ?? 0);
+        return;
+      }
+      if (resolution.kind === 'unsafe') {
+        debug?.finish('result_rejected', { reason: 'unsafe' }, false);
+        // 归属不安全（多候选歧义/快照失效）：自动重试可能删错楼，fail closed 交人工。
+        await this.dependencies.runtime.pauseForHostResultFailure();
+        return;
+      }
+      const messageIndex = resolution.messageIndex;
+      debug?.step('body_resolved', { messageIndex });
+      const chat = this.dependencies.runtime.getChat();
+      if (messageIndex !== chat.length - 1) {
+        debug?.finish('result_rejected', { reason: 'not_tail', messageIndex }, false);
+        await this.dependencies.runtime.pauseForHostResultFailure();
+        return;
+      }
+      const message = chat[messageIndex];
+      const body = String(message?.mes ?? '');
+      if (!body.trim()) {
+        debug?.finish('result_rejected', { reason: 'empty_body', messageIndex }, false);
+        await this.dependencies.runtime.rejectHostTurnForFailedGeneration();
+        await this.autoRetryHostGenerationIfReady_ACU(snapshot.settings.retryDelaySeconds ?? 0);
+        return;
+      }
+      if (!message || !validateLoopTags_ACU(body, snapshot.settings.loopTags)) {
+        debug?.finish('result_rejected', { reason: 'missing_tags', messageIndex }, false);
+        await this.dependencies.runtime.rejectHostTurnForMissingTags({ messageIndex });
+        await this.autoRetryHostGenerationIfReady_ACU(snapshot.settings.retryDelaySeconds ?? 0);
+        return;
+      }
+      const minTokens = Number.isInteger(snapshot.settings.minGenerationTokens) ? snapshot.settings.minGenerationTokens as number : 0;
+      if (minTokens > 0) {
+        const countTokens = this.dependencies.countTokens ?? countAgentTokens_ACU;
+        const tokenCount = await countTokens(body);
+        if (tokenCount < minTokens) {
+          debug?.finish('result_rejected', { reason: 'short_body', messageIndex }, false);
+          await this.dependencies.runtime.rejectHostTurnForShortGeneration({ messageIndex, tokenCount, threshold: minTokens });
+          await this.autoRetryHostGenerationIfReady_ACU(snapshot.settings.retryDelaySeconds ?? 0);
+          return;
+        }
+      }
+      debug?.step('confirm_start', { messageIndex });
+      await this.dependencies.runtime.confirmCurrentTurn(messageIndex);
+      debug?.finish('confirmed', { messageIndex });
+    } catch (error) {
+      debug?.finish('failed', { reason: 'exception', errorType: continuationDebugErrorType_ACU(error) }, false);
+      // A bridge failure must not leave an attributable turn indefinitely running.
+      // The guarded fallback preserves a stale/persistence error when it can no
+      // longer safely write the original task identity.
+      try {
+        await this.dependencies.runtime.pauseForHostResultFailure();
+      } catch {
+        // No safe write remains after a stale or persistence failure.
+      }
+      return;
+    } finally {
+      if (redirect) this.releaseRedirect_ACU(chatIdentity, redirect);
+      this.notifyStateChanges_ACU();
+    }
+    await this.autoContinueAfterTurn_ACU();
+  }
+
+  /**
+   * 宿主生成被中止（GENERATION_STOPPED）：等待中的宿主轮不会再有结束事件，
+   * 转入 retry_ready + 暂停，用户可重试当前轮或继续/停止，不再卡死在等待态。
+   */
+  async onGenerationStopped(sequence: number | undefined): Promise<void> {
+    const runtime = this.dependencies.runtime;
+    const chatIdentity = runtime.getChatIdentity();
+    const started = this.startedByChat.get(chatIdentity) ?? null;
+    const redirect = this.redirectsByChat.get(chatIdentity);
+    if (redirect && (redirect.completionStarted || redirect.phase !== 'resuming' || sequence === redirect.sourceSequence)) return;
+    const snapshot = runtime.readPendingHostTurn();
+    if (!snapshot || snapshot.pending.status !== 'awaiting_generation') return;
+    const boundSequence = snapshot.pending.capture.generationSeq ?? started?.sequence ?? null;
+    if (boundSequence !== null && sequence !== undefined && boundSequence !== sequence) return;
+    this.captureGenerationDebug(sequence)?.finish('stopped', { seq: sequence });
+    if (redirect) redirect.completionStarted = true;
+    this.startedByChat.delete(chatIdentity);
+    this.dispatchedByChat.delete(chatIdentity);
+    if (this.localRetryClaim?.attemptId === snapshot.pending.identity.attemptId) this.localRetryClaim = null;
+    if (started) {
+      try { await started.bind; } catch { /* 绑定失败不阻碍中止转换 */ }
+    }
+    try {
+      await runtime.failHostTurnForStoppedGeneration();
+    } catch {
+      // 状态已变化（轮次已被其他路径推进/暂停）时无需补写。
+    }
+    if (redirect) this.releaseRedirect_ACU(chatIdentity, redirect);
+    this.notifyStateChanges_ACU();
+  }
+
+  /**
+   * 一轮正文确认成功后的自动续写：等待轮次延迟后自动触发下一轮，
+   * 与正文重试自动链同构。资格在延迟前后各读一次——用户可能在延迟期间停止任务。
+   * continueTask 的失败已由 orchestrator 落为 paused+lastError，这里不再改写状态。
+   */
+  private async autoContinueAfterTurn_ACU(): Promise<void> {
+    const runtime = this.dependencies.runtime;
+    const state = runtime.readAutoContinueState();
+    if (!state.eligible) return;
+    await this.dependencies.wait(state.delaySeconds * 1_000);
+    if (!runtime.readAutoContinueState().eligible) return;
+    try {
+      const result = await runtime.continueTask();
+      if (result.retryHostGeneration) await this.retryHostGeneration();
+      else if (result.preparedTurn) await this.send(result.preparedTurn);
+    } catch (error) {
+      // 状态已由 orchestrator 记录（paused+lastError 或拒绝原因），自动链到此为止；
+      // 但必须在会话流留痕——静默吞掉会让用户以为自动续写根本没触发。
+      const message = error instanceof Error ? error.message : String(error);
+      logAgentSession_ACU({ kind: 'run_failed', title: '自动续写已暂停', detail: `${message}\n进度已保留，输入新指令后发送即可继续。`, ok: false });
+    } finally {
+      this.notifyStateChanges_ACU();
+    }
+  }
+
+  /**
+   * 解析本轮宿主正文的楼层归属。
+   * - resolved：唯一候选，可安全确认。
+   * - no_reply：物化等待耗尽仍无任何候选——生成失败或未产出正文，可安全自动重试
+   *   （没有楼层被写入）。生成出错时宿主的 message_id 常为 undefined，非整数锚点
+   *   不短路：解析器各锚点分支自带整数守卫，会自然落到捕获边界候选扫描。
+   * - unsafe：多候选歧义 / 快照失效 / 聊天已切换——自动重试可能重复楼层，fail closed。
+   */
+  private async resolveMessageIndex_ACU(eventMessageId: unknown, capture: ContinuationHostGenerationCapture_ACU, chatIdentity: string): Promise<{ kind: 'resolved'; messageIndex: number } | { kind: 'no_reply' } | { kind: 'unsafe' }> {
+    const anchor = Number.isInteger(eventMessageId) ? (eventMessageId as number) : Number.NaN;
+    const intent: AutoFillIntent_ACU = { eventMessageId: anchor, chatKey: chatIdentity, isolationKey: '', capturedAt: capture.capturedAt, capturedChatLength: capture.capturedChatLength, capturedAiFloorCount: capture.capturedAiFloorCount, generationSeq: capture.generationSeq ?? undefined };
+    for (let attempt = 0; attempt <= this.dependencies.materializationRetries; attempt += 1) {
+      if (this.dependencies.runtime.getChatIdentity() !== chatIdentity) return { kind: 'unsafe' };
+      const result = resolveGeneratedAiMessageIndex_ACU({ liveChat: this.dependencies.runtime.getChat(), intent });
+      if (result.kind === 'resolved') return { kind: 'resolved', messageIndex: result.messageIndex };
+      if (result.kind !== 'pending_materialization') return { kind: 'unsafe' };
+      if (attempt === this.dependencies.materializationRetries) return { kind: 'no_reply' };
+      await this.dependencies.wait(this.dependencies.materializationRetryDelayMs);
+    }
+    return { kind: 'no_reply' };
+  }
+
+  private async autoRetryHostGenerationIfReady_ACU(retryDelaySeconds: number): Promise<void> {
+    const afterReject = this.dependencies.runtime.readPendingHostTurn();
+    if (afterReject?.pending.status !== 'retry_ready') return;
+    const attemptId = afterReject.pending.identity.attemptId;
+    await this.dependencies.wait(Math.max(0, retryDelaySeconds) * 1_000);
+    const beforeRetry = this.dependencies.runtime.readPendingHostTurn();
+    if (beforeRetry?.pending.status !== 'retry_ready' || beforeRetry.pending.identity.attemptId !== attemptId) return;
+    const action = await this.dependencies.runtime.retryCurrentTurn();
+    if (!action.retryHostGeneration) return;
+    const chatIdentity = this.dependencies.runtime.getChatIdentity();
+    const redirect = this.redirectsByChat.get(chatIdentity);
+    // 旧请求已结算为重试；新请求必须能够独立认领自己的开始和结束事件。
+    if (redirect?.completionStarted && redirect.attemptId === attemptId) this.releaseRedirect_ACU(chatIdentity, redirect);
+    await this.retryHostGeneration();
+  }
+
+  private getMatchingLocalRetryClaim_ACU(context: ContinuationHostGenerationEventContext_ACU, sequence: number | undefined): LocalRetryClaim_ACU | null {
+    const claim = this.localRetryClaim;
+    if (!claim || claim.consumed || !context.automaticTrigger || context.quietLike || context.dryRun) return null;
+    if (this.dependencies.now() - claim.createdAt > ContinuationHostGenerationBridge_ACU.LOCAL_RETRY_CLAIM_TTL_MS) {
+      this.localRetryClaim = null;
+      return null;
+    }
+    if (claim.sequence !== null && sequence !== undefined && claim.sequence !== sequence) return null;
+    const snapshot = this.dependencies.runtime.readPendingHostTurn();
+    if (!snapshot || snapshot.pending.status !== 'awaiting_generation' || snapshot.pending.identity.attemptId !== claim.attemptId) return null;
+    return claim;
+  }
+
+  /**
+   * 用酒馆自己的重新生成/生成链路重试当前轮，不再让 Agent 另造一条请求。
+   * 本轮正文已在末楼时走 regenerate（酒馆会删掉该楼）；正文尚未产出时对指令楼 generate。
+   * 楼层形状与发送时的捕获快照对不上（用户删掉了指令楼或更早的正文）就放弃：
+   * 此时 regenerate 会误删上一轮正文，应由调用方回到 Agent 重新规划。
+   */
+  async retryHostGeneration(): Promise<boolean> {
+    const runtime = this.dependencies.runtime;
+    const snapshot = runtime.readPendingHostTurn();
+    if (!snapshot || snapshot.pending.status !== 'retry_ready') return false;
+    if (snapshot.pending.identity.chatIdentity !== runtime.getChatIdentity()) return false;
+    const chat = runtime.getChat();
+    const mode = resolveHostRetryMode_ACU(chat, snapshot.pending.capture);
+    if (!mode) {
+      logAgentSession_ACU({ kind: 'run_failed', title: '放弃宿主重发', detail: '楼层已与发送时不一致（承载指令的用户楼或上一轮正文已被删除），直接重发会落错位置。请发送一条消息让主 Agent 按现存楼层重新规划。', ok: false });
+      return false;
+    }
+    const aiCount = countAiMessages_ACU(chat);
+    const capture: ContinuationHostGenerationCapture_ACU = {
+      capturedAt: this.dependencies.now(),
+      capturedChatLength: mode === 'regenerate' ? Math.max(0, chat.length - 1) : chat.length,
+      capturedAiFloorCount: mode === 'regenerate' ? Math.max(0, aiCount - 1) : aiCount,
+      generationSeq: null,
+    };
+    const attemptId = snapshot.pending.identity.attemptId;
+    await runtime.recordHostTurn({ capture });
+    this.localRetryClaim = { attemptId, mode, createdAt: this.dependencies.now(), sequence: null, consumed: false };
+    this.sendingAttemptId = attemptId;
+    this.notifyStateChanges_ACU();
+    try {
+      if (!this.dependencies.hostInput.retryGeneration(mode)) {
+        this.localRetryClaim = null;
+        await runtime.pauseForHostInputFailure();
+        return false;
+      }
+      return true;
+    } finally {
+      this.sendingAttemptId = null;
+    }
+  }
+}

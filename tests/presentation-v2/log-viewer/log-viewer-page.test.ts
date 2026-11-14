@@ -1,0 +1,512 @@
+/**
+ * AdvancedToolsPage 日志面板集成 — 运行日志布局、筛选与实时订阅
+ *
+ * @vitest-environment jsdom
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const STORAGE_KEY = 'acu_v2_ui_state';
+
+async function waitForUi(ms = 0) {
+  await new Promise(r => setTimeout(r, ms));
+}
+
+async function mountAdvancedToolsLogPanel(seedLogs = true, warnLogEnabled = seedLogs) {
+  vi.resetModules();
+  document.body.innerHTML = '';
+  document.head.innerHTML = '';
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    uiTierV2: { tier: 'high' }, router: { activePageId: 'advanced-tools' },
+    devOptions: { warnLogEnabled },
+  }));
+
+  const logBuffer = await import('../../../src/shared/log-buffer');
+  if (seedLogs) {
+    logBuffer.setDebugLogEnabled(true);
+    logBuffer.pushLog('debug', ['[ACU]', '[调试] Debug 初始化日志']);
+    logBuffer.pushLog('warn', ['[ACU]', '[SQL] 警告日志']);
+    logBuffer.pushLog('error', ['[ACU]', '[导入] 错误日志']);
+    logBuffer.setDebugLogEnabled(false);
+  }
+
+  vi.stubGlobal('URL', {
+    createObjectURL: vi.fn(() => 'blob:acu-log-test'),
+    revokeObjectURL: vi.fn(),
+  });
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+
+  const mount = await import('../../../src/presentation-v2/bootstrap/mount');
+  await mount.openAcuV2App();
+  await waitForUi();
+
+  return {
+    mount,
+    logBuffer,
+  };
+}
+
+function getPage(): HTMLElement {
+  const page = document.querySelector<HTMLElement>('.acu-v2-advanced-tools-page');
+  expect(page).not.toBeNull();
+  return page!;
+}
+
+function findButton(label: string): HTMLButtonElement {
+  const button = Array.from(document.querySelectorAll<HTMLButtonElement>('.acu-v2-advanced-tools-page__log-panel button'))
+    .find(el => el.textContent?.includes(label));
+  expect(button).not.toBeUndefined();
+  return button!;
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe('AdvancedToolsPage log panel', () => {
+  it('渲染高级工具页内运行日志面板，状态徽章留在面板标题区', async () => {
+    const { mount } = await mountAdvancedToolsLogPanel();
+
+    const page = getPage();
+    const text = page.textContent || '';
+    expect(text).toContain('运行日志');
+    expect(text).toContain('全部级别');
+    expect(text).toContain('全部模块');
+    expect(text).toContain('SQL 控制台');
+    expect(page.querySelector<HTMLInputElement>('.acu-v2-advanced-tools-page input')?.placeholder).toBe('搜索日志内容');
+    expect(text).toContain('自动滚动');
+    expect(text).toContain('错误日志');
+    expect(text).toContain('警告日志');
+    expect(text).not.toContain('缓冲区状态');
+
+    const panels = document.querySelectorAll('.acu-v2-advanced-tools-page .acu-panel');
+    expect(panels.length).toBe(2);
+    panels.forEach(panel => {
+      expect(panel.querySelector('.acu-panel__description-region .acu-info-banner')).not.toBeNull();
+      expect(panel.querySelector('.acu-panel__header .acu-info-banner')).toBeNull();
+    });
+
+    const mobileNavItems = Array.from(page.querySelectorAll('.acu-mobile-panel-nav__item'))
+      .map(item => item.textContent?.trim());
+    expect(mobileNavItems).toEqual(['SQL 控制台', '运行日志']);
+    expect(document.querySelector('.acu-v2-app__page-title')?.textContent?.trim()).toBe('高级工具');
+    expect(page.querySelector('.acu-page-header')).toBeNull();
+    expect(page.querySelector('.acu-v2-advanced-tools-page__log-panel .acu-panel__header')?.textContent || '').toContain('实时更新中');
+
+    const controlRow = page.querySelector<HTMLElement>('.acu-v2-advanced-tools-page__log-control-row');
+    expect(controlRow).not.toBeNull();
+    const [controlMain, hint] = Array.from(controlRow!.children) as HTMLElement[];
+    expect(controlMain.classList.contains('acu-v2-advanced-tools-page__log-control-main')).toBe(true);
+    expect(hint.classList.contains('acu-v2-advanced-tools-page__hint')).toBe(true);
+    const [actions, toggles] = Array.from(controlMain.children) as HTMLElement[];
+    expect(actions.classList.contains('acu-v2-advanced-tools-page__log-actions')).toBe(true);
+    expect(toggles.classList.contains('acu-v2-advanced-tools-page__toggles')).toBe(true);
+    const toggleLabels = Array.from(toggles.querySelectorAll<HTMLButtonElement>('.acu-toggle'))
+      .map(toggle => toggle.textContent?.trim());
+    expect(toggleLabels).toEqual(['自动滚动', 'API 请求', 'Warn', 'Debug']);
+    expect(hint.textContent || '').toContain('当前显示');
+
+    mount.__resetAcuV2MountForTests();
+  });
+
+  it('error 日志下方附带可展开的处理建议，warn / debug 不带', async () => {
+    const { mount, logBuffer } = await mountAdvancedToolsLogPanel(false, true);
+    logBuffer.clearLogs();
+    logBuffer.pushLog('error', ['[ACU]', '[正文优化] API调用失败: Error: API请求失败: 429 rate limit']);
+    logBuffer.pushLog('warn', ['[ACU]', '[SQL] 一条警告']);
+    await waitForUi(30);
+
+    const rows = Array.from(document.querySelectorAll<HTMLElement>('.acu-v2-advanced-tools-page__log-row'));
+    expect(rows.length).toBe(2);
+    const errorRow = rows.find(row => row.classList.contains('acu-v2-advanced-tools-page__log-row--error'))!;
+    const warnRow = rows.find(row => row.classList.contains('acu-v2-advanced-tools-page__log-row--warn'))!;
+
+    const hint = errorRow.querySelector<HTMLDetailsElement>('.acu-v2-advanced-tools-page__log-hint');
+    expect(hint).not.toBeNull();
+    expect(hint!.dataset.hintId).toBe('http-429');
+    expect(hint!.open).toBe(false);
+    expect(hint!.textContent).toContain('限流');
+    expect(hint!.textContent).toContain('怎么处理');
+    expect(hint!.querySelectorAll('.acu-v2-advanced-tools-page__log-hint-steps li').length).toBeGreaterThan(0);
+
+    expect(warnRow.querySelector('.acu-v2-advanced-tools-page__log-hint')).toBeNull();
+
+    mount.__resetAcuV2MountForTests();
+  });
+
+  it('按级别和关键词筛选日志列表', async () => {
+    const { mount } = await mountAdvancedToolsLogPanel();
+
+    const levelSelect = document.querySelector<HTMLElement>('.acu-v2-advanced-tools-page .acu-select');
+    expect(levelSelect).not.toBeNull();
+    levelSelect!.querySelector<HTMLButtonElement>('.acu-select__trigger')!.click();
+    await waitForUi();
+    const errorItem = Array.from(levelSelect!.querySelectorAll<HTMLElement>('.acu-select__item'))
+      .find(item => item.textContent?.trim() === 'Error');
+    expect(errorItem).not.toBeUndefined();
+    errorItem!.click();
+    await waitForUi();
+
+    let text = document.querySelector('.acu-v2-advanced-tools-page__log-list')?.textContent || '';
+    expect(text).toContain('错误日志');
+    expect(text).not.toContain('警告日志');
+
+    const search = document.querySelector<HTMLInputElement>('.acu-v2-advanced-tools-page input');
+    expect(search).not.toBeNull();
+    search!.value = '不存在的关键词';
+    search!.dispatchEvent(new Event('input', { bubbles: true }));
+    await waitForUi();
+
+    text = document.querySelector('.acu-v2-advanced-tools-page__log-list')?.textContent || '';
+    expect(text).toContain('暂无匹配日志');
+
+    mount.__resetAcuV2MountForTests();
+  });
+
+  it('Warn 默认关闭，开启后持久化并恢复采集', async () => {
+    const { mount, logBuffer } = await mountAdvancedToolsLogPanel(false, false);
+
+    expect(logBuffer.isWarnLogEnabled()).toBe(false);
+    logBuffer.pushLog('warn', ['[ACU]', '[SQL] 默认隐藏']);
+    await waitForUi(30);
+    expect(getPage().textContent || '').not.toContain('默认隐藏');
+
+    const warnToggle = Array.from(document.querySelectorAll<HTMLButtonElement>('.acu-v2-advanced-tools-page .acu-toggle'))
+      .find(button => button.textContent?.includes('Warn'));
+    expect(warnToggle).not.toBeUndefined();
+    expect(warnToggle!.getAttribute('aria-checked')).toBe('false');
+    warnToggle!.click();
+    await waitForUi();
+
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    expect(persisted?.devOptions?.warnLogEnabled).toBe(true);
+    expect(warnToggle!.getAttribute('aria-checked')).toBe('true');
+    expect(logBuffer.isWarnLogEnabled()).toBe(true);
+
+    logBuffer.pushLog('warn', ['[ACU]', '[SQL] 开启后显示']);
+    await waitForUi(30);
+    expect(getPage().textContent || '').toContain('开启后显示');
+
+    mount.__resetAcuV2MountForTests();
+    vi.resetModules();
+
+    const reloadedLogBuffer = await import('../../../src/shared/log-buffer');
+    expect(reloadedLogBuffer.isWarnLogEnabled()).toBe(true);
+    reloadedLogBuffer.pushLog('warn', ['[ACU]', '[SQL] 重载后仍显示']);
+    expect(reloadedLogBuffer.getAllLogs().some(entry => entry.message.includes('重载后仍显示'))).toBe(true);
+    reloadedLogBuffer._resetForTesting();
+  });
+
+  it('暂停时新日志进入积压，恢复后刷新显示', async () => {
+    const { mount, logBuffer } = await mountAdvancedToolsLogPanel(false, true);
+
+    findButton('暂停').click();
+    await waitForUi();
+    logBuffer.pushLog('warn', ['[ACU]', '[暂停测试] 暂停期间新增']);
+    await waitForUi(30);
+
+    let pageText = getPage().textContent || '';
+    expect(pageText).toContain('1 条暂停期间新增日志等待显示');
+    expect(document.querySelector('.acu-v2-advanced-tools-page__log-list')?.textContent || '').not.toContain('暂停期间新增');
+
+    findButton('暂停').click();
+    await waitForUi();
+
+    pageText = getPage().textContent || '';
+    expect(pageText).toContain('暂停期间新增');
+    expect(pageText).toContain('实时更新中');
+
+    mount.__resetAcuV2MountForTests();
+  });
+
+  it('API 请求与 Debug 独立采集，持久化恢复并保留脱敏分行', async () => {
+    const { mount, logBuffer } = await mountAdvancedToolsLogPanel(false);
+
+    const { createApiRequestLog_ACU, observeApiResponse_ACU } = await import('../../../src/shared/api-request-log');
+    const { logAutoFillSkip_ACU } = await import('../../../src/shared/trigger-diagnostics');
+    const disabledLogs = [];
+    for (const tag of ['API主连接', 'API连接预设', 'API酒馆转发', 'API直连']) {
+      const log = createApiRequestLog_ACU(tag, '请求', { messages: [{ role: 'user', content: `完整提示词 ${tag}` }] });
+      log.write('回复', `完整回复 ${tag}`);
+      disabledLogs.push(log);
+    }
+    logAutoFillSkip_ACU('no_tables_due');
+    const getter = vi.fn();
+    const disabledResponse = Object.defineProperty({}, 'body', { get: getter }) as Response;
+    const observed = observeApiResponse_ACU(disabledResponse, disabledLogs[0]);
+    expect(observed.response).toBe(disabledResponse);
+    observed.finish();
+    expect(getter).not.toHaveBeenCalled();
+    await waitForUi(30);
+    const defaultText = getPage().textContent || '';
+    for (const tag of ['API主连接', 'API连接预设', 'API酒馆转发', 'API直连']) {
+      expect(defaultText).not.toContain(`完整提示词 ${tag}`);
+      expect(defaultText).not.toContain(`完整回复 ${tag}`);
+    }
+    expect(defaultText).not.toContain('no_tables_due');
+    expect(defaultText).toContain('API 请求开关独立采集');
+    expect(defaultText).toContain('关闭采集不会删除已有日志');
+    expect(defaultText).toContain('不代表最终网络请求');
+    expect(defaultText).toContain('检查隐私');
+    expect(logBuffer.isDebugLogEnabled()).toBe(false);
+    expect(logBuffer.isApiLogEnabled()).toBe(false);
+    expect(logBuffer.getAllLogs()).toHaveLength(0);
+
+    logBuffer.pushLog('debug', ['[ACU]', '[调试] 不应出现']);
+    await waitForUi(30);
+    expect(getPage().textContent || '').not.toContain('不应出现');
+
+    const debugToggle = Array.from(document.querySelectorAll<HTMLButtonElement>('.acu-v2-advanced-tools-page .acu-toggle'))
+      .find(button => button.textContent?.includes('Debug'));
+    expect(debugToggle).not.toBeUndefined();
+    debugToggle!.click();
+    await waitForUi();
+
+    logBuffer.pushLog('debug', ['[ACU]', '[调试] Debug 已采集']);
+    logAutoFillSkip_ACU('no_tables_due');
+    createApiRequestLog_ACU('API直连', '请求', { messages: [{ content: '只开 Debug 不采集 API' }] });
+    await waitForUi(30);
+    expect(logBuffer.getAllLogs()).toHaveLength(2);
+    expect(getPage().textContent || '').toContain('no_tables_due');
+    expect(getPage().textContent || '').not.toContain('只开 Debug 不采集 API');
+
+    debugToggle!.click();
+    const apiToggle = Array.from(document.querySelectorAll<HTMLButtonElement>('.acu-v2-advanced-tools-page .acu-toggle'))
+      .find(button => button.textContent?.trim() === 'API 请求');
+    expect(apiToggle).not.toBeUndefined();
+    expect(apiToggle!.getAttribute('aria-checked')).toBe('false');
+    apiToggle!.click();
+    await waitForUi();
+    expect(apiToggle!.getAttribute('aria-checked')).toBe('true');
+    expect(logBuffer.isDebugLogEnabled()).toBe(false);
+    expect(logBuffer.isApiLogEnabled()).toBe(true);
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    expect(persisted.devOptions.apiLogEnabled).toBe(true);
+    expect(persisted.devOptions.warnLogEnabled).toBe(false);
+    expect(persisted.router.activePageId).toBe('advanced-tools');
+    logBuffer.clearLogs();
+    logAutoFillSkip_ACU('no_tables_due');
+    logBuffer.pushLog('debug', ['[ACU]', '[调试] 只开 API 不采集 Debug']);
+    expect(logBuffer.getAllLogs()).toHaveLength(0);
+    disabledLogs[0].write('回复', '开启前请求不补采集');
+    const activeLogs = [];
+    const prompt = '提示词首行\n提示词次行';
+    const literalPath = String.raw`C:\notes\new.txt`;
+    for (const tag of ['API主连接', 'API连接预设', 'API酒馆转发', 'API直连']) {
+      const request = { messages: [{ role: 'user', content: prompt }], api_key: 'log-secret', path: literalPath,
+        body: JSON.stringify({ messages: [{ role: 'system', content: '嵌套首行\n嵌套次行' }] }) };
+      const log = createApiRequestLog_ACU(tag, '请求', request);
+      log.write('回复', JSON.stringify({ choices: [{ message: { content: '回复首行\n回复次行 log-secret' } }] }));
+      expect(request.messages[0].content).toBe(prompt);
+      activeLogs.push(log);
+    }
+    logAutoFillSkip_ACU('no_tables_due');
+    await waitForUi(30);
+
+    const text = getPage().textContent || '';
+    expect(text).toContain('Debug 未采集');
+    expect(text).toContain('API 采集中');
+    expect(text).not.toContain('no_tables_due');
+    expect(text).not.toContain('只开 API 不采集 Debug');
+    expect(text).not.toContain('log-secret');
+    expect(text).not.toContain('开启前请求不补采集');
+    expect(logBuffer.getAllLogs()).toHaveLength(8);
+    expect(logBuffer.getAllLogs().every(entry => entry.level === 'api')).toBe(true);
+    const bodyText = Array.from(getPage().querySelectorAll('.acu-v2-advanced-tools-page__log-body'))
+      .map(body => body.textContent || '').join('\n');
+    expect(bodyText).toMatch(/提示词首行\n +提示词次行/);
+    expect(bodyText).toMatch(/回复首行\n +回复次行/);
+    expect(bodyText).toMatch(/嵌套首行\n +嵌套次行/);
+    expect(bodyText).not.toContain(String.raw`提示词首行\n提示词次行`);
+    expect(bodyText).toContain(JSON.stringify(literalPath));
+    const apiRow = getPage().querySelector('.acu-v2-advanced-tools-page__log-row--api');
+    expect(apiRow).not.toBeNull();
+    expect(apiRow!.querySelector('.acu-badge')?.textContent?.trim()).toBe('API');
+    const levelSelect = getPage().querySelector<HTMLElement>('.acu-select')!;
+    levelSelect.querySelector<HTMLButtonElement>('.acu-select__trigger')!.click();
+    await waitForUi();
+    const apiOption = Array.from(levelSelect.querySelectorAll<HTMLElement>('.acu-select__item'))
+      .find(item => item.textContent?.trim() === 'API 请求');
+    expect(apiOption).not.toBeUndefined();
+    apiOption!.click();
+    await waitForUi();
+    expect(getPage().querySelectorAll('.acu-v2-advanced-tools-page__log-row--api')).toHaveLength(8);
+    findButton('导出').click();
+    await waitForUi();
+    expect(URL.createObjectURL).toHaveBeenCalled();
+
+    // 两个开关同时开启时两种日志各自采集。
+    debugToggle!.click();
+    await waitForUi();
+    logAutoFillSkip_ACU('no_tables_due');
+    activeLogs[0].write('回复', '两个开关同时开启');
+    expect(logBuffer.getAllLogs()).toHaveLength(10);
+    expect(logBuffer.getAllLogs().at(-2)!.level).toBe('debug');
+    expect(logBuffer.getAllLogs().at(-1)!.level).toBe('api');
+    expect(getPage().querySelectorAll('.acu-v2-advanced-tools-page__log-row--debug')).toHaveLength(0);
+
+    const count = logBuffer.getAllLogs().length;
+    apiToggle!.click();
+    await waitForUi();
+    activeLogs[0].write('回复', '关闭后不再采集');
+    createApiRequestLog_ACU('API直连', '请求', { messages: [{ content: '关闭后请求' }] });
+    expect(logBuffer.getAllLogs()).toHaveLength(count);
+    expect(logBuffer.isDebugLogEnabled()).toBe(true);
+    expect(logBuffer.isApiLogEnabled()).toBe(false);
+    logAutoFillSkip_ACU('no_tables_due');
+    expect(logBuffer.getAllLogs()).toHaveLength(count + 1);
+    debugToggle!.click();
+    await waitForUi(30);
+    expect(logBuffer.isDebugLogEnabled()).toBe(false);
+    expect(getPage().textContent || '').not.toContain('关闭后不再采集');
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}').devOptions.apiLogEnabled).toBe(false);
+
+    // 已保存的开关在 Vue 挂载前恢复，Debug 仍默认关闭。
+    apiToggle!.click();
+    await waitForUi();
+    mount.__resetAcuV2MountForTests();
+    vi.resetModules();
+    const reloadedLogBuffer = await import('../../../src/shared/log-buffer');
+    expect(reloadedLogBuffer.isApiLogEnabled()).toBe(true);
+    expect(reloadedLogBuffer.isDebugLogEnabled()).toBe(false);
+    const reloadedApi = await import('../../../src/shared/api-request-log');
+    reloadedApi.createApiRequestLog_ACU('API直连', '请求', { messages: [{ content: '重载后 API 请求' }] });
+    expect(reloadedLogBuffer.getAllLogs()[0].level).toBe('api');
+    const reloadedMount = await import('../../../src/presentation-v2/bootstrap/mount');
+    await reloadedMount.openAcuV2App();
+    await waitForUi();
+    const reloadedToggle = Array.from(getPage().querySelectorAll<HTMLButtonElement>('.acu-toggle'))
+      .find(button => button.textContent?.trim() === 'API 请求')!;
+    expect(reloadedToggle.getAttribute('aria-checked')).toBe('true');
+    expect(getPage().textContent || '').toContain('重载后 API 请求');
+    reloadedToggle.click();
+    await waitForUi();
+    reloadedMount.__resetAcuV2MountForTests();
+    vi.resetModules();
+    const disabledAfterReload = await import('../../../src/shared/log-buffer');
+    expect(disabledAfterReload.isApiLogEnabled()).toBe(false);
+  });
+
+  it('清空与导出使用当前筛选后的日志数据', async () => {
+    const { mount, logBuffer } = await mountAdvancedToolsLogPanel(false, true);
+    logBuffer.clearLogs();
+    logBuffer.setDebugLogEnabled(true);
+    logBuffer.pushLog('debug', ['[ACU]', '[调试] Debug 导出日志']);
+    logBuffer.pushLog('warn', ['[ACU]', '[SQL] 警告导出日志']);
+    logBuffer.pushLog('error', ['[ACU]', '[导入] 错误导出日志']);
+    logBuffer.setDebugLogEnabled(false);
+    await waitForUi(30);
+
+    findButton('导出').click();
+    await waitForUi();
+    expect(URL.createObjectURL).toHaveBeenCalled();
+    expect(HTMLAnchorElement.prototype.click).toHaveBeenCalled();
+    expect(getPage().textContent || '').not.toContain('已导出 3 条日志');
+
+    findButton('清空').click();
+    await waitForUi();
+    const text = getPage().textContent || '';
+    expect(text).not.toContain('日志缓冲区已清空');
+    expect(text).toContain('暂无匹配日志');
+
+    mount.__resetAcuV2MountForTests();
+  });
+});
+
+
+// 直接挂载 composable，避免容量用例为数千条日志创建 DOM；缓冲区与响应式状态保持真实。
+async function mountLogViewerFlow() {
+  vi.resetModules();
+  const vue = await import('vue');
+  const { createPinia } = await import('pinia');
+  const logBuffer = await import('../../../src/shared/log-buffer');
+  logBuffer._resetForTesting();
+  const hostEnv = await import('../../../src/presentation-v2/bootstrap/host-env');
+  const frames = new Map<number, FrameRequestCallback>();
+  let frameId = 0;
+  vi.spyOn(hostEnv, 'acuRequestAnimationFrame').mockImplementation(callback => {
+    frames.set(++frameId, callback);
+    return frameId;
+  });
+  vi.spyOn(hostEnv, 'acuCancelAnimationFrame').mockImplementation(id => { frames.delete(id); });
+  const { useLogViewer } = await import('../../../src/presentation-v2/composables/useLogViewer');
+  let viewer!: ReturnType<typeof useLogViewer>;
+  const container = document.createElement('div');
+  const app = vue.createApp(vue.defineComponent({
+    setup() { viewer = useLogViewer(); return () => vue.h('div'); },
+  }));
+  app.use(createPinia());
+  app.mount(container);
+  return { viewer, app, logBuffer, frames };
+}
+
+describe('暂停日志的有界计数与生命周期', () => {
+  it('4000 条输入仅累计有界计数，冻结视图不追加对象，恢复只读最新缓冲区', async () => {
+    const { viewer, app, logBuffer, frames } = await mountLogViewerFlow();
+    try {
+      logBuffer.pushLog('error', ['暂停前']);
+      viewer.refresh();
+      viewer.setPaused(true);
+      const frozenLogs = viewer.logs.value;
+      for (let i = 0; i < 4000; i++) logBuffer.pushLog('error', [`暂停日志 ${i}`]);
+      expect(logBuffer.getLogCount()).toBe(2000);
+      expect(viewer.pendingCount.value).toBe(2000);
+      expect(viewer.logs.value).toBe(frozenLogs);
+      expect(frozenLogs).toHaveLength(1);
+      expect(frames.size).toBe(0);
+      viewer.setPaused(false);
+      expect(viewer.pendingCount.value).toBe(0);
+      expect(viewer.logs.value).toEqual(logBuffer.getAllLogs());
+      expect(viewer.logs.value[0].message).toBe('暂停日志 2000');
+      expect(viewer.logs.value.at(-1)!.message).toBe('暂停日志 3999');
+    } finally { app.unmount(); logBuffer._resetForTesting(); }
+  });
+
+  it('字符预算淘汰同步限制待显示数量，清空后可继续暂停计数', async () => {
+    const { viewer, app, logBuffer } = await mountLogViewerFlow();
+    try {
+      viewer.setPaused(true);
+      const largeBody = 'x'.repeat(Math.floor(logBuffer.MAX_BUFFER_CHARACTERS_ACU / 2) + 1);
+      for (let i = 0; i < 4; i++) logBuffer.pushLog('error', [largeBody]);
+      expect(logBuffer.getLogCount()).toBe(1);
+      expect(viewer.pendingCount.value).toBe(1);
+      expect(viewer.logs.value).toEqual([]);
+      viewer.clearAll();
+      expect(logBuffer.getLogCount()).toBe(0);
+      expect(viewer.pendingCount.value).toBe(0);
+      expect(viewer.paused.value).toBe(true);
+      logBuffer.pushLog('error', ['清空后']);
+      expect(viewer.pendingCount.value).toBe(1);
+      viewer.setPaused(false);
+      expect(viewer.logs.value.map(entry => entry.message)).toEqual(['清空后']);
+      expect(viewer.pendingCount.value).toBe(0);
+    } finally { app.unmount(); logBuffer._resetForTesting(); }
+  });
+
+  it('暂停取消排队刷新，卸载释放订阅、视图与待显示计数', async () => {
+    const { viewer, app, logBuffer, frames } = await mountLogViewerFlow();
+    try {
+      expect(logBuffer.getSubscriberCount()).toBe(1);
+      logBuffer.pushLog('error', ['排队中']);
+      expect(frames.size).toBe(1);
+      viewer.setPaused(true);
+      expect(frames.size).toBe(0);
+      expect(viewer.logs.value).toEqual([]);
+      logBuffer.pushLog('error', ['暂停中']);
+      expect(viewer.pendingCount.value).toBe(1);
+      viewer.setPaused(false);
+      expect(viewer.logs.value).toHaveLength(2);
+      logBuffer.pushLog('error', ['卸载前排队']);
+      expect(frames.size).toBe(1);
+    } finally { app.unmount(); }
+    expect(logBuffer.getSubscriberCount()).toBe(0);
+    expect(frames.size).toBe(0);
+    expect(viewer.logs.value).toEqual([]);
+    expect(viewer.pendingCount.value).toBe(0);
+    logBuffer.pushLog('error', ['卸载后']);
+    expect(viewer.logs.value).toEqual([]);
+    expect(viewer.pendingCount.value).toBe(0);
+    logBuffer._resetForTesting();
+  });
+});

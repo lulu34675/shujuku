@@ -1,0 +1,676 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { _set_SillyTavern_API_ACU } from '../../../../src/shared/host-api';
+import { AGENT_MODULE_FIELD_ACU } from '../../../../src/service/continuation/agent/agent-model';
+import { buildEmptyAgentModuleSnapshot_ACU, readAgentModuleFieldSnapshot_ACU, readAgentModuleSnapshot_ACU } from '../../../../src/service/continuation/agent/agent-module-store';
+import { commitAgentModuleFieldWrites_ACU } from '../../../../src/service/continuation/agent/agent-module-field-commit';
+
+const INSERT_PARTIAL = "INSERT INTO hooks (id, summary, expected_revision) VALUES ('H1', '信件', 0)";
+const UPDATE_REST = "UPDATE hooks SET status = 'planted', importance = 'mid', planted_index = 1, planned_payoff = '' WHERE id = 'H1' AND expected_revision = 1";
+function setup() {
+  const snapshot = { ...buildEmptyAgentModuleSnapshot_ACU(), settledThroughIndex: 1 };
+  const chat: any[] = [
+    { is_user: false, mes: 'root', [AGENT_MODULE_FIELD_ACU]: snapshot },
+    { is_user: false, mes: 'tail' },
+  ];
+  const saveChat = vi.fn().mockResolvedValue(undefined);
+  _set_SillyTavern_API_ACU({ chat, saveChat } as any);
+  return { chat, saveChat };
+}
+beforeEach(() => _set_SillyTavern_API_ACU(null as any));
+describe('续写逐栏真实提交', () => {
+  it('没写 id 和 expected_revision 时按顺序补号，卷状态也一起补上', async () => {
+    const { chat } = setup();
+    const sql = [
+      "INSERT INTO story_arc (title, direction, escalation, withheld) VALUES ('全书', '方向', '台阶', '底牌')",
+      "INSERT INTO story_arc (scope, title, direction, escalation, withheld, narrative_role, target_stage_range, target_time_span, progress_ceiling, sustaining_threads, payoff_targets) VALUES ('volume', '卷一', '方向', '台阶', '底牌', 'setup', '{\"min\":6,\"max\":10}', '十日', '到婚礼', '[\"线\"]', '[\"兑现\"]')",
+      "INSERT INTO story_arc (title, direction, escalation, withheld, narrative_role, target_stage_range, target_time_span, progress_ceiling, sustaining_threads, payoff_targets) VALUES ('卷二', '方向', '台阶', '底牌', 'development', '{\"min\":6,\"max\":10}', '十日', '到后宅', '[\"线\"]', '[\"兑现\"]')",
+    ].join('; ');
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql, role: 'arc-architect' });
+    expect(receipt.rejected.map(item => `${item.path}:${item.reason}`)).toEqual([]);
+    expect(receipt.status).toBe('committed');
+    const arc = readAgentModuleSnapshot_ACU(chat).storyArc;
+    expect(arc.map(item => item.id).sort()).toEqual(['STORY-01', 'VOL-01', 'VOL-02']);
+    expect(arc.find(item => item.id === 'VOL-01')?.status).toBe('active');
+    expect(arc.find(item => item.id === 'VOL-02')?.status).toBe('planned');
+    const renamed = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: "UPDATE story_arc SET title = '新全书' WHERE id = 'STORY-01'", role: 'arc-architect' });
+    expect(renamed.status).toBe('committed');
+    expect(readAgentModuleSnapshot_ACU(chat).storyArc.find(item => item.id === 'STORY-01')?.title).toBe('新全书');
+    const hook = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: "INSERT INTO hooks (summary) VALUES ('信件')", role: 'hook-cognition-maintainer' });
+    expect(hook.status).toBe('committed');
+    expect(hook.accepted.map(item => item.id)).toContain('H001');
+  });
+
+  it('总纲单栏写入拒绝照抄格式示例，同时接受真实短标题', async () => {
+    const { chat } = setup();
+    const bad = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role: 'arc-architect',
+      sql: "INSERT INTO story_arc (id, title, direction, expected_revision) VALUES ('STORY-01', '简称', '本层推进方向与人物驱动力', 0)",
+    });
+    expect(bad.status).toBe('committed');
+    expect(bad.accepted.map(item => item.field)).toEqual(['scope', 'status']);
+    expect(bad.rejected).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'storyArc#STORY-01.title', reason: expect.stringContaining('不能照抄') }),
+      expect.objectContaining({ path: 'storyArc#STORY-01.direction', reason: expect.stringContaining('不能照抄') }),
+    ]));
+    const saved = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role: 'arc-architect',
+      sql: `UPDATE story_arc SET title = '标题', direction = '主角追查禁区的真实来历' WHERE id = 'STORY-01' AND expected_revision = ${bad.revisions?.storyArc}`,
+    });
+    expect(saved.status).toBe('committed');
+    expect(saved.partials).toEqual(expect.arrayContaining([expect.objectContaining({ module: 'storyArc', id: 'STORY-01', missingFields: expect.arrayContaining(['escalation', 'withheld']) })]));
+  });
+
+  it('同一条 SQL 一次写入多条新卷，再用同一修订号一次补齐 withheld', async () => {
+    const { chat } = setup();
+    const insert = [
+      "INSERT INTO story_arc (id, scope, title, direction, escalation, status, expected_revision) VALUES ('STORY-01', 'story', '全书', '方向', '台阶', 'active', 0)",
+      "INSERT INTO story_arc (id, scope, title, direction, escalation, narrative_role, target_stage_range, target_time_span, progress_ceiling, sustaining_threads, payoff_targets, status, expected_revision) VALUES ('VOL-01', 'volume', '卷一', '方向', '台阶', 'setup', '{\"min\":6,\"max\":10}', '十日', '到婚礼', '[\"线\"]', '[\"兑现\"]', 'active', 0)",
+      "INSERT INTO story_arc (id, scope, title, direction, escalation, narrative_role, target_stage_range, target_time_span, progress_ceiling, sustaining_threads, payoff_targets, status, expected_revision) VALUES ('VOL-02', 'volume', '卷二', '方向', '台阶', 'development', '{\"min\":6,\"max\":10}', '十日', '到后宅', '[\"线\"]', '[\"兑现\"]', 'planned', 0)",
+    ].join('; ');
+    const inserted = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: insert, role: 'arc-architect' });
+    expect(inserted.status).toBe('committed');
+    expect(inserted.rejected.filter(item => item.reason.includes('revision_conflict'))).toEqual([]);
+    expect(inserted.partials?.map(item => item.id).sort()).toEqual(['STORY-01', 'VOL-01', 'VOL-02']);
+    const revision = inserted.revisions?.storyArc;
+    const update = ['STORY-01', 'VOL-01', 'VOL-02']
+      .map(id => `UPDATE story_arc SET withheld = '底牌' WHERE id = '${id}' AND expected_revision = ${revision}`)
+      .join('; ');
+    const filled = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: update, role: 'arc-architect' });
+    expect(filled.rejected.map(item => `${item.path}:${item.reason}`)).toEqual([]);
+    expect(filled.status).toBe('committed');
+    expect(filled.rejected).toEqual([]);
+    expect(readAgentModuleSnapshot_ACU(chat).storyArc.map(item => item.id).sort()).toEqual(['STORY-01', 'VOL-01', 'VOL-02']);
+  });
+
+  it('两次写入先保留草稿再提升完整领域行', async () => {
+    const { chat, saveChat } = setup();
+    const first = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(first.status).toBe('committed');
+    expect(first.accepted).toEqual([{ module: 'hooks', id: 'H1', field: 'summary', revision: 1 }]);
+    expect(readAgentModuleSnapshot_ACU(chat).hooks).toHaveLength(0);
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.status).toBe('partial');
+    const second = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: UPDATE_REST, role: 'hook-cognition-maintainer' });
+    expect(second.status).toBe('committed');
+    expect(readAgentModuleSnapshot_ACU(chat).hooks[0]?.summary).toBe('信件');
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.status).toBe('complete');
+    expect(saveChat).toHaveBeenCalledTimes(2);
+  });
+
+  it('已有完整行的一栏非法时保留独立合法栏目', async () => {
+    const { chat } = setup();
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: UPDATE_REST, role: 'hook-cognition-maintainer' });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: "UPDATE hooks SET summary = '新信件', status = 'invalid' WHERE id = 'H1' AND expected_revision = 2", role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('committed');
+    expect(receipt.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'hooks#H1.status' })]));
+    expect(readAgentModuleSnapshot_ACU(chat).hooks[0].summary).toBe('新信件');
+  });
+
+  it('宿主保存失败不会出具 accepted 并恢复楼层', async () => {
+    const { chat, saveChat } = setup();
+    const before = structuredClone(chat);
+    saveChat.mockRejectedValueOnce(new Error('disk failure'));
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt.status).not.toBe('committed');
+    expect(receipt.accepted).toEqual([]);
+    expect(receipt.partials).toEqual([]);
+    expect(chat).toEqual(before);
+  });
+
+  it('补栏保存失败时回执只报告原先已保存的缺栏，而非未落盘的提升结果', async () => {
+    const { chat, saveChat } = setup();
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    saveChat.mockRejectedValueOnce(new Error('disk failure'));
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: UPDATE_REST, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'persist_failed', accepted: [], recovery: 'saved' });
+    expect(receipt.partials).toEqual([expect.objectContaining({ module: 'hooks', id: 'H1', missingFields: expect.arrayContaining(['status', 'importance', 'plantedIndex']) })]);
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.status).toBe('partial');
+    expect(readAgentModuleSnapshot_ACU(chat).hooks).toHaveLength(0);
+  });
+
+  it('补偿失败时不把先前快照的缺栏和 revision 当作当前确认状态', async () => {
+    const { chat, saveChat } = setup();
+    expect((await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' })).status).toBe('committed');
+    saveChat.mockRejectedValueOnce(new Error('primary failed')).mockRejectedValueOnce(new Error('rollback failed'));
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: UPDATE_REST, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'persist_failed', recovery: 'failed', accepted: [], partials: null, revisions: null });
+  });
+
+  it('损坏资料帧只返回结构化失败，不附带宽容折叠出的缺栏', async () => {
+    const { chat, saveChat } = setup();
+    chat[0][AGENT_MODULE_FIELD_ACU] = { schemaVersion: 3, deltas: 'corrupt' };
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'rejected', accepted: [], partials: null, revisions: null });
+    expect(receipt.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'frame' })]));
+    expect(saveChat).not.toHaveBeenCalled();
+  });
+
+  it('无既有资料基线也能新建草稿', async () => {
+    const chat: any[] = [{ is_user: false, mes: 'tail' }];
+    _set_SillyTavern_API_ACU({ chat, saveChat: vi.fn().mockResolvedValue(undefined) } as any);
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 0, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('committed');
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.status).toBe('partial');
+  });
+
+  it('保存后宿主修改资料帧时回读失败且不发 accepted', async () => {
+    const { chat, saveChat } = setup();
+    saveChat.mockImplementationOnce(async () => { chat[1][AGENT_MODULE_FIELD_ACU].deltas = []; });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('readback_failed');
+    expect(receipt.accepted).toEqual([]);
+  });
+
+  it('web_refs 页面句柄回填来源，拒绝模型伪造 URL', async () => {
+    const { chat } = setup();
+    const receipt = await commitAgentModuleFieldWrites_ACU({
+      chat, targetIndex: 1, role: 'web-researcher',
+      sql: "INSERT INTO web_refs (name, brief, page_ref, expected_revision) VALUES ('海域', '世界设定', 'p1', 0)",
+      resolvePage: handle => handle === 'p1' ? { title: '海域', source: 'web', url: 'https://example.org/a', query: '海域', sourceStatus: 'ok' } : null,
+    });
+    expect(receipt.status).toBe('committed');
+    expect(readAgentModuleSnapshot_ACU(chat).webRefs[0]).toMatchObject({ id: 'WR-001', url: 'https://example.org/a' });
+  });
+
+
+  it('同一模块两个独立 ID 的合法栏目只推进一次模块 revision', async () => {
+    const { chat, saveChat } = setup();
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role: 'hook-cognition-maintainer',
+      sql: `${INSERT_PARTIAL}; INSERT INTO hooks (id, summary, expected_revision) VALUES ('H2', '另一封信', 0)`,
+    });
+    expect(receipt.status).toBe('committed');
+    expect(receipt.accepted).toHaveLength(2);
+    expect(receipt.revisions.hooks).toBe(1);
+    expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('非法单栏、伪证据、陈旧 revision 与越权不保存', async () => {
+    const { chat, saveChat } = setup();
+    const cases = [
+      { role: 'hook-cognition-maintainer' as const, sql: "INSERT INTO hooks (id, status, expected_revision) VALUES ('H1', 'fake', 0)" },
+      { role: 'hook-cognition-maintainer' as const, sql: "INSERT INTO chronology (id, evidence_indexes, expected_revision) VALUES ('T1', '[99]', 0)" },
+      { role: 'hook-cognition-maintainer' as const, sql: "INSERT INTO hooks (id, summary, expected_revision) VALUES ('H1', '信', 99)" },
+      { role: 'arc-architect' as const, sql: INSERT_PARTIAL },
+    ];
+    for (const input of cases) {
+      const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, ...input });
+      expect(receipt.status).toBe('rejected');
+      expect(receipt.accepted).toEqual([]);
+    }
+    expect(saveChat).not.toHaveBeenCalled();
+  });
+
+  it('已有 ID 的退役需理由，partial DELETE 仅丢弃草稿', async () => {
+    const { chat } = setup();
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: "DELETE FROM hooks WHERE id = 'H1' AND expected_revision = 1 AND reason = '草稿作废'", role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('committed');
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1).toBeUndefined();
+  });
+
+  it('补偿保存也失败时诊断双重失败且不出具接受回执', async () => {
+    const { chat, saveChat } = setup();
+    saveChat.mockRejectedValue(new Error('disk broken'));
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('persist_failed');
+    expect(receipt.recovery).toBe('failed');
+    expect(receipt.accepted).toEqual([]);
+    expect(saveChat).toHaveBeenCalledTimes(2);
+  });
+
+  it('补偿保存中字段被监听器改写时不报告已恢复落盘', async () => {
+    const { chat, saveChat } = setup();
+    saveChat.mockRejectedValueOnce(new Error('primary failed')).mockImplementationOnce(async () => {
+      chat[1][AGENT_MODULE_FIELD_ACU] = { schemaVersion: 3, deltas: [] };
+    });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'persist_failed', accepted: [], recovery: 'unavailable' });
+    expect(chat[1][AGENT_MODULE_FIELD_ACU]).toEqual({ schemaVersion: 3, deltas: [] });
+    expect(saveChat).toHaveBeenCalledTimes(2);
+  });
+
+  it('保存中切换聊天不发接受回执，并保留新聊天', async () => {
+    const { chat, saveChat } = setup();
+    const other = [{ is_user: false, mes: 'other' }];
+    saveChat.mockImplementationOnce(async () => { _set_SillyTavern_API_ACU({ chat: other, saveChat } as any); });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('readback_failed');
+    expect(receipt.accepted).toEqual([]);
+    expect(other[0]).toEqual({ is_user: false, mes: 'other' });
+  });
+
+
+  it('信息差 SQL 的多余 JSON 转义自动清洗并保存，缺字段和坏结构仍拒绝', async () => {
+    const { chat, saveChat } = setup();
+    const role = 'hook-cognition-maintainer' as const;
+    const knowledge = [{ name: '顾雨涵', knows: '亲眼看到"信件"；路径 C:\\线索\nO\'Brien' }];
+    const escaped = JSON.stringify(JSON.stringify(knowledge)).slice(1, -1).replace(/'/g, "''");
+    const created = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role,
+      sql: `INSERT INTO info_gap (id, topic, objective_fact, reader_known, character_knowledge, reveal_status) VALUES ('E001', '秘密', '信件', '已见信件', '${escaped}', 'unrevealed')` });
+    expect(created.status).toBe('committed');
+    expect(created.rejected).toEqual([]);
+    expect(created.accepted).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'E001', field: 'characterKnowledge' })]));
+    expect(readAgentModuleSnapshot_ACU(chat).infoGap.find(item => item.id === 'E001')?.characterKnowledge).toEqual(knowledge);
+    const nextKnowledge = [{ name: '公孙千虑', knows: '亲手递交信件，知道全部内容' }];
+    const updated = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role,
+      sql: `UPDATE info_gap SET character_knowledge = '${JSON.stringify(JSON.stringify(nextKnowledge)).slice(1, -1)}' WHERE id = 'E001'` });
+    expect(updated.status).toBe('committed');
+    expect(updated.rejected).toEqual([]);
+    expect(readAgentModuleSnapshot_ACU(chat).infoGap.find(item => item.id === 'E001')?.characterKnowledge).toEqual(nextKnowledge);
+    saveChat.mockClear();
+    for (const raw of [JSON.stringify(JSON.stringify([{ name: '角色' }])).slice(1, -1),
+      String.raw`[{\"name\":\"角色\",\"knows\":\"未闭合}]`]) {
+      const rejected = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role,
+        sql: `UPDATE info_gap SET character_knowledge = '${raw}' WHERE id = 'E001'` });
+      expect(rejected.status).toBe('rejected');
+      expect(rejected.accepted).toEqual([]);
+      expect(rejected.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'infoGap#E001.characterKnowledge' })]));
+      expect(readAgentModuleSnapshot_ACU(chat).infoGap.find(item => item.id === 'E001')?.characterKnowledge).toEqual(nextKnowledge);
+    }
+    expect(saveChat).not.toHaveBeenCalled();
+  });
+
+  it('信息差揭示两栏同批合并，非法成组时只拒绝相依栏', async () => {
+    const { chat } = setup();
+    const sql = "INSERT INTO info_gap (id, topic, objective_fact, reader_known, character_knowledge, reveal_status, expected_revision) VALUES ('G1', '秘密', '钥匙', '无人知道', '[]', 'unrevealed', 0)";
+    expect((await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql, role: 'hook-cognition-maintainer' })).status).toBe('committed');
+    const change = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: "UPDATE info_gap SET reveal_status = 'revealed', reveal_index = 1, reader_known = '已见钥匙' WHERE id = 'G1' AND expected_revision = 1", role: 'hook-cognition-maintainer' });
+    expect(change.status).toBe('committed');
+    expect(readAgentModuleSnapshot_ACU(chat).infoGap[0]).toMatchObject({ revealStatus: 'revealed', revealIndex: 1, readerKnown: '已见钥匙' });
+    const invalid = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: "UPDATE info_gap SET reveal_status = 'unrevealed', reader_known = '另有线索' WHERE id = 'G1' AND expected_revision = 2", role: 'hook-cognition-maintainer' });
+    expect(invalid.status).toBe('committed');
+    expect(invalid.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'infoGap#G1.revealStatus' })]));
+    expect(readAgentModuleSnapshot_ACU(chat).infoGap[0]).toMatchObject({ revealStatus: 'revealed', readerKnown: '另有线索' });
+  });
+
+  it('信息差单独回退未揭示时自动清除旧揭示楼层，显式冲突楼层仍拒绝', async () => {
+    const { chat } = setup();
+    const insert = "INSERT INTO info_gap (id, topic, objective_fact, reader_known, character_knowledge, reveal_status, expected_revision) VALUES ('G2', '秘密', '钥匙', '无人知道', '[]', 'unrevealed', 0)";
+    expect((await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: insert, role: 'hook-cognition-maintainer' })).status).toBe('committed');
+    const revealed = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1,
+      sql: "UPDATE info_gap SET reveal_status = 'revealed', reveal_index = 1 WHERE id = 'G2' AND expected_revision = 1",
+      role: 'hook-cognition-maintainer',
+    });
+    expect(revealed.status).toBe('committed');
+    const reset = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1,
+      sql: "UPDATE info_gap SET reveal_status = 'unrevealed' WHERE id = 'G2' AND expected_revision = 2",
+      role: 'hook-cognition-maintainer',
+    });
+    expect(reset.status).toBe('committed');
+    expect(reset.rejected).toEqual([]);
+    expect(readAgentModuleSnapshot_ACU(chat).infoGap.find(item => item.id === 'G2')).toMatchObject({ revealStatus: 'unrevealed', revealIndex: null });
+    const conflict = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1,
+      sql: "UPDATE info_gap SET reveal_status = 'unrevealed', reveal_index = 1 WHERE id = 'G2' AND expected_revision = 3",
+      role: 'hook-cognition-maintainer',
+    });
+    expect(conflict.status).toBe('rejected');
+    expect(conflict.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'infoGap#G2.revealIndex' })]));
+    expect(conflict.alreadySaved).toEqual([expect.objectContaining({ module: 'infoGap', id: 'G2', field: 'revealStatus', value: 'unrevealed' })]);
+    expect(readAgentModuleSnapshot_ACU(chat).infoGap.find(item => item.id === 'G2')).toMatchObject({ revealStatus: 'unrevealed', revealIndex: null });
+  });
+
+  it('web_refs 无法解析页面句柄时保留独立草稿，不伪造完整行', async () => {
+    const { chat } = setup();
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role: 'web-researcher',
+      sql: "INSERT INTO web_refs (name, brief, page_ref, expected_revision) VALUES ('海域', '世界设定', 'fake', 0)",
+      resolvePage: () => null,
+    });
+    expect(receipt.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'webRefs#WR-001.pageRef' })]));
+    expect(readAgentModuleSnapshot_ACU(chat).webRefs).toHaveLength(0);
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.webRefs?.['WR-001'].status).toBe('partial');
+  });
+
+  it('同一条草稿重复调用单栏 UPDATE 不伪造第二个完整 ID', async () => {
+    const { chat } = setup();
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    const update = "UPDATE hooks SET summary = '信件' WHERE id = 'H1' AND expected_revision = 1";
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: update, role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('committed');
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.fields.summary.revision).toBe(1);
+  });
+
+
+  it('旧 v1 全量资料被读作基线；新逐栏 delta 不覆写旧楼原文', async () => {
+    const { chat, saveChat } = setup();
+    const legacy = {
+      schemaVersion: 1, settledThroughIndex: 1, updatedAt: 1,
+      revisions: { hooks: 0, infoGap: 0, constraints: 0, storyArc: 0 },
+      hooks: [], infoGap: [], constraints: [],
+    };
+    chat[0][AGENT_MODULE_FIELD_ACU] = legacy;
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'committed', accepted: [{ module: 'hooks', id: 'H1', field: 'summary', revision: 1 }] });
+    expect(chat[0][AGENT_MODULE_FIELD_ACU]).toBe(legacy);
+    expect(chat[1][AGENT_MODULE_FIELD_ACU]).toMatchObject({ schemaVersion: 3 });
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.status).toBe('partial');
+    expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('旧基线和中间楼草稿经新末楼 checkpoint 迁移后保留，删末楼回退到原资料', async () => {
+    const { chat } = setup();
+    expect((await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' })).status).toBe('committed');
+    const first = structuredClone(chat[1][AGENT_MODULE_FIELD_ACU]);
+    chat.push({ is_user: false, mes: '新末楼' });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 2,
+      sql: "INSERT INTO hooks (id, summary, expected_revision) VALUES ('H2', '第二封信', 1)", role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('committed');
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.fields.summary.value).toBe('信件');
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H2.fields.summary.value).toBe('第二封信');
+    expect(chat[1][AGENT_MODULE_FIELD_ACU]).toEqual(first);
+    chat.pop();
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H2).toBeUndefined();
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.fields.summary.value).toBe('信件');
+  });
+
+  it('切换 swipe 后不覆写旧 swipe 基线', async () => {
+    const chat: any[] = [{ is_user: false, mes: 'root', swipe_id: 0,
+      [AGENT_MODULE_FIELD_ACU]: { ...buildEmptyAgentModuleSnapshot_ACU(), settledThroughIndex: 0 } }];
+    const saveChat = vi.fn().mockResolvedValue(undefined);
+    _set_SillyTavern_API_ACU({ chat, saveChat } as any);
+    const first = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 0, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(first.status).toBe('committed');
+    const frame = structuredClone(chat[0][AGENT_MODULE_FIELD_ACU]);
+    chat[0].swipe_id = 1;
+    const switched = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 0, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(switched.status).toBe('rejected');
+    expect(chat[0][AGENT_MODULE_FIELD_ACU]).toEqual(frame);
+    expect(saveChat).toHaveBeenCalledTimes(1);
+    chat[0].swipe_id = 0;
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.status).toBe('partial');
+  });
+
+  it.each([0, 1])('保存期间重建第 %s 楼并改写正文仍确认逐栏提交', async index => {
+    const { chat, saveChat } = setup();
+    saveChat.mockImplementationOnce(async () => {
+      chat[index] = { ...structuredClone(chat[index]), mes: '第三方最新正文' };
+    });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('committed');
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.fields.summary.value).toBe('信件');
+    expect(chat[index].mes).toBe('第三方最新正文');
+    expect(saveChat).toHaveBeenCalledOnce();
+  });
+
+  it.each([0, 1])('保存失败且第 %s 楼对象重建后恢复私有资料，保留最新正文', async index => {
+    const { chat, saveChat } = setup();
+    const before = structuredClone(chat);
+    saveChat.mockImplementationOnce(async () => {
+      chat[index] = { ...structuredClone(chat[index]), mes: '第三方最新正文' };
+      throw new Error('primary failed');
+    }).mockImplementationOnce(async () => {
+      chat[index] = { ...structuredClone(chat[index]), mes: '补偿期间的新正文' };
+    });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'persist_failed', recovery: 'saved', accepted: [] });
+    expect(chat[0][AGENT_MODULE_FIELD_ACU]).toEqual(before[0][AGENT_MODULE_FIELD_ACU]);
+    expect(chat[1][AGENT_MODULE_FIELD_ACU]).toBeUndefined();
+    expect(chat[index].mes).toBe('补偿期间的新正文');
+    expect(saveChat).toHaveBeenCalledTimes(2);
+  });
+
+
+  it('宿主保存返回前切换 active swipe 不签发旧派工 accepted', async () => {
+    const { chat, saveChat } = setup();
+    chat[1].swipe_id = 0;
+    saveChat.mockImplementationOnce(async () => { chat[1].swipe_id = 1; });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'readback_failed', accepted: [], recovery: 'unavailable' });
+    expect(chat[1].swipe_id).toBe(1);
+    expect(saveChat).toHaveBeenCalledOnce();
+  });
+
+  it('宿主保存期间切换先前楼层 swipe 同样使逐栏回读失效', async () => {
+    const { chat, saveChat } = setup();
+    chat[0].swipe_id = 0;
+    saveChat.mockImplementationOnce(async () => { chat[0].swipe_id = 1; });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'readback_failed', accepted: [], recovery: 'unavailable' });
+    expect(chat[0].swipe_id).toBe(1);
+    expect(saveChat).toHaveBeenCalledOnce();
+  });
+
+  it('损坏的旧资料帧不允许在其宽容结果上提交', async () => {
+    const { chat, saveChat } = setup();
+    chat[0][AGENT_MODULE_FIELD_ACU] = { schemaVersion: 3, deltas: 'corrupt' };
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('rejected');
+    expect(receipt.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'frame' })]));
+    expect(saveChat).not.toHaveBeenCalled();
+  });
+
+
+  it('证据号虽不越水位但指向用户楼时逐栏拒绝', async () => {
+    const { chat, saveChat } = setup();
+    chat[0].is_user = true;
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role: 'hook-cognition-maintainer',
+      sql: "INSERT INTO chronology (id, evidence_indexes, expected_revision) VALUES ('T1', '[0]', 0)",
+    });
+    expect(receipt.status).toBe('rejected');
+    expect(receipt.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'chronology#T1.evidenceIndexes' })]));
+    expect(saveChat).not.toHaveBeenCalled();
+  });
+
+  it('保存监听器改写未暂存的旧基线时不能在陈旧读取上签发 accepted', async () => {
+    const { chat, saveChat } = setup();
+    saveChat.mockImplementationOnce(async () => {
+      chat[0][AGENT_MODULE_FIELD_ACU].hooks = [{ id: 'H-old', summary: '监听器线索', status: 'planted', importance: 'mid', plantedIndex: 0, updatedIndex: 0, plannedPayoff: '', retired: false, retiredReason: '' }];
+    });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'readback_failed', accepted: [], recovery: 'unavailable' });
+    expect(chat[0][AGENT_MODULE_FIELD_ACU].hooks[0].summary).toBe('监听器线索');
+  });
+
+  it('保存监听器原地改写暂存帧时不能签发 accepted，也不能擦除监听器变更', async () => {
+    const { chat, saveChat } = setup();
+    saveChat.mockImplementationOnce(async () => {
+      chat[1][AGENT_MODULE_FIELD_ACU].deltas.at(-1).fieldUpserts.hooks.H1.summary.value = '监听器改写';
+    });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'readback_failed', accepted: [], recovery: 'unavailable' });
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H1.fields.summary.value).toBe('监听器改写');
+    expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('旧楼基线保存期间变化时不发起可能覆盖新数据的补偿保存', async () => {
+    const { chat, saveChat } = setup();
+    saveChat.mockImplementationOnce(async () => {
+      chat[0][AGENT_MODULE_FIELD_ACU].hooks = [{ id: 'H-old', summary: '新保存的线索' }];
+    });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    expect(receipt).toMatchObject({ status: 'readback_failed', recovery: 'unavailable', accepted: [], partials: null, revisions: null });
+    expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('排队期间旧派工租约失效，迟到写入不触发宿主保存', async () => {
+    const { chat, saveChat } = setup();
+    let release!: () => void;
+    saveChat.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const first = commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    await vi.waitFor(() => expect(saveChat).toHaveBeenCalledTimes(1));
+    let active = true;
+    const second = commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1,
+      sql: "INSERT INTO hooks (id, summary, expected_revision) VALUES ('H2', '迟到信件', 1)",
+      role: 'hook-cognition-maintainer', isCurrent: () => active });
+    active = false;
+    release();
+    expect((await first).status).toBe('committed');
+    expect(await second).toMatchObject({ status: 'rejected', accepted: [] });
+    expect(readAgentModuleFieldSnapshot_ACU(chat).records.hooks?.H2).toBeUndefined();
+    expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('宿主保存返回时租约失效，不签发 accepted 也不尝试旧派工补偿', async () => {
+    const { chat, saveChat } = setup();
+    let active = true;
+    saveChat.mockImplementationOnce(async () => { active = false; });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL,
+      role: 'hook-cognition-maintainer', isCurrent: () => active });
+    expect(receipt).toMatchObject({ status: 'readback_failed', accepted: [], recovery: 'unavailable' });
+    expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('系统字段误写仍被拒但可核实完整目标，不保存或递增版本', async () => {
+    const { chat, saveChat } = setup();
+    const role = 'hook-cognition-maintainer' as const;
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role, sql: INSERT_PARTIAL });
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role, sql: UPDATE_REST });
+    const before = JSON.stringify(chat);
+    saveChat.mockClear();
+    const sql = "UPDATE hooks SET recent_floor=8, expected_revision=3 WHERE id='H1' AND expected_revision=2";
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role, sql });
+    expect(receipt.status).toBe('rejected');
+    expect(receipt.accepted).toEqual([]);
+    expect(receipt.operationOnlyConfirmed).toEqual([{ module: 'hooks', id: 'H1', revision: 2,
+      rejectedPaths: ['hooks#H1.recent_floor', 'sql[0].hooks.expected_revision', 'sql[0].hooks'] }]);
+    expect(JSON.stringify(chat)).toBe(before);
+    expect(saveChat).not.toHaveBeenCalled();
+    for (const statement of [sql.replace('expected_revision=2', 'expected_revision=1'), sql.replace("id='H1'", "id='H2'"),
+      "UPDATE hooks SET recent_floor=8, bogus=3 WHERE id='H1' AND expected_revision=2",
+      "UPDATE hooks SET recent_floor=8, status='invalid' WHERE id='H1' AND expected_revision=2"]) {
+      const rejected = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role, sql: statement });
+      expect(rejected.operationOnlyConfirmed).toBeUndefined();
+    }
+    const stale = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role, sql, isCurrent: () => false });
+    expect(stale.operationOnlyConfirmed).toBeUndefined();
+    expect(stale.rejected.at(-1)?.reason).toContain('派工租约已失效');
+    const { correctAgentMaterials_ACU } = await import('../../../../src/service/continuation/agent/agent-main-correction');
+    const corrected = await correctAgentMaterials_ACU({ action: { kind: 'correct_materials', thought: '', reason: '撤回系统字段操作', sql },
+      chat, conversation: { messages: [] } as any, isCurrent: () => true, completedStages: [] });
+    expect(corrected).toMatchObject({ status: 'committed', operationOnly: true, sqlReceipt: { status: 'rejected', accepted: [] } });
+    expect(JSON.stringify(chat)).toBe(before);
+    expect(saveChat).not.toHaveBeenCalled();
+    const { AGENT_OPERATION_ONLY_PENDING_MESSAGE_ACU } = await import('../../../../src/service/continuation/agent/agent-module-field-commit');
+    const { captureAgentModuleCommitBaseline_ACU, writeAgentModuleCommitDelta_ACU } = await import('../../../../src/service/continuation/agent/agent-module-store');
+    const pendingFixes = [{ module: 'hooks' as const, agentName: role, source: 'transaction_rejected' as const,
+      completion: 'failed' as const, attempts: 1, firstFailedAtIndex: 1, lastError: '操作与真实缺口待处理',
+      rangeStartIndex: 1, rangeEndIndex: 1, acceptedKeys: [], createdAt: 1, updatedAt: 1,
+      violations: [
+        { path: 'hooks#H1.operationOnly', message: AGENT_OPERATION_ONLY_PENDING_MESSAGE_ACU },
+        { path: 'hooks#H2.operationOnly', message: AGENT_OPERATION_ONLY_PENDING_MESSAGE_ACU },
+        { path: 'hooks#H1.status', message: '待核对的业务变化' },
+        { path: 'sql[0].hooks', message: '旧记录无条目身份' },
+      ] }];
+    const seeded = await writeAgentModuleCommitDelta_ACU(chat, 1, { writes: {}, revisions: {}, pendingFixes }, Date.now(),
+      folded => folded.snapshot.pendingFixes[0]?.violations.length === 4, captureAgentModuleCommitBaseline_ACU(chat));
+    expect(seeded.status).toBe('committed');
+    expect(readAgentModuleSnapshot_ACU(chat).pendingFixes).toEqual(pendingFixes);
+    const baseline = readAgentModuleSnapshot_ACU(chat);
+    saveChat.mockClear();
+    const repaired = await correctAgentMaterials_ACU({ action: { kind: 'correct_materials', thought: '', reason: '核实同一条目', sql },
+      chat, conversation: { messages: [] } as any, isCurrent: () => true, completedStages: [] });
+    expect(repaired).toMatchObject({ status: 'committed', operationOnly: true, sqlReceipt: { status: 'rejected', accepted: [] } });
+    const persisted = readAgentModuleSnapshot_ACU(chat);
+    expect(persisted.pendingFixes).toEqual([{ ...pendingFixes[0], violations: pendingFixes[0].violations.slice(1) }]);
+    expect(persisted.hooks).toEqual(baseline.hooks);
+    expect(persisted.revisions).toEqual(baseline.revisions);
+    expect(persisted.settledThroughIndex).toBe(baseline.settledThroughIndex);
+    expect(saveChat).toHaveBeenCalledOnce();
+    saveChat.mockClear();
+    const repeated = await correctAgentMaterials_ACU({ action: { kind: 'correct_materials', thought: '', reason: '重复核实', sql },
+      chat, conversation: { messages: [] } as any, isCurrent: () => true, completedStages: [] });
+    expect(repeated).toMatchObject({ status: 'committed', operationOnly: true });
+    expect(readAgentModuleSnapshot_ACU(chat).pendingFixes).toEqual(persisted.pendingFixes);
+    expect(saveChat).not.toHaveBeenCalled();
+  });
+
+  it('部分条目不能由纯系统字段拒绝签发无变化证明', async () => {
+    const { chat } = setup();
+    const role = 'hook-cognition-maintainer' as const;
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role, sql: INSERT_PARTIAL });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role,
+      sql: "UPDATE hooks SET recent_floor=8 WHERE id='H1' AND expected_revision=1" });
+    expect(receipt.status).toBe('rejected');
+    expect(receipt.operationOnlyConfirmed).toBeUndefined();
+    expect(receipt.partials).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'H1', missingFields: expect.arrayContaining(['status']) })]));
+    const { reconcileAgentOperationOnlyPending_ACU, AGENT_OPERATION_ONLY_PENDING_MESSAGE_ACU } = await import('../../../../src/service/continuation/agent/agent-module-field-commit');
+    const fix = { module: 'hooks' as const, agentName: role, source: 'transaction_rejected' as const, attempts: 1,
+      firstFailedAtIndex: 1, lastError: '待核实', violations: [
+        { path: 'hooks#H1.operationOnly', message: AGENT_OPERATION_ONLY_PENDING_MESSAGE_ACU },
+     { path: 'hooks#H1.status', message: '缺栏' }, { path: 'sql[0].hooks', message: '旧记录无身份' }] };
+    const proof = { module: 'hooks' as const, id: 'H1', revision: 1, rejectedPaths: [] };
+    expect(reconcileAgentOperationOnlyPending_ACU([fix], [{ ...proof, id: 'H2' }])).toEqual([fix]);
+    expect(reconcileAgentOperationOnlyPending_ACU([fix], [proof])[0].violations).toEqual(fix.violations.slice(1));
+  });
+
+  it('逐栏清账仅接受同模块同条目的具体字段回执', async () => {
+    const { reconcileAgentFieldPending_ACU } = await import('../../../../src/service/continuation/agent/agent-module-field-commit');
+    const fix = { module: 'hooks' as const, agentName: 'hook-cognition-maintainer', source: 'transaction_rejected' as const,
+      attempts: 1, firstFailedAtIndex: 1, lastError: '待修', violations: [
+        { path: 'hooks#H1.summary', message: '旧字段拒绝' }, { path: 'hooks#H1.status', message: '缺栏' },
+        { path: 'hooks#H1.operationOnly', message: '待核实操作' }, { path: 'sql[0].hooks', message: '无身份诊断' }] };
+    expect(reconcileAgentFieldPending_ACU([fix], ['hooks:H1:summary'])[0].violations).toEqual(fix.violations.slice(1));
+    for (const key of ['hooks:H1', 'hooks:H2:summary', 'hooks:H1:recent_floor', 'hooks:H1:operationOnly']) {
+      expect(reconcileAgentFieldPending_ACU([fix], [key])).toEqual([fix]);
+    }
+    expect(reconcileAgentFieldPending_ACU([{ ...fix, source: 'invoke_failed' }], ['hooks:H1:summary']))
+      .toEqual([{ ...fix, source: 'invoke_failed' }]);
+  });
+
+  it.each(['complete', 'partial', 'invalid', 'conflict', 'failed-save', 'stale', 'changed-chat', 'changed-swipe', 'ambiguous'] as const)(
+    '%s 新建系统字段拒绝仅由同语句落账及权威回读绑定身份', async scenario => {
+      const { chat, saveChat } = setup();
+      const role = 'hook-cognition-maintainer' as const;
+      const hook = "INSERT INTO hooks (id, summary, status, importance, planted_index, planned_payoff) VALUES ('H1', '信件', 'planted', 'mid', 1, '')";
+      const gap = scenario === 'partial'
+        ? "INSERT INTO info_gap (topic, recent_floor) VALUES ('门后信件', 1)"
+        : `INSERT INTO info_gap (topic, objective_fact, reader_known, character_knowledge, reveal_status, reveal_index, recent_floor${scenario === 'conflict' ? ', expected_revision' : ''}) VALUES ('门后信件', '守门人藏着信件', '读者未见', '[]', '${scenario === 'invalid' ? 'invalid' : 'unrevealed'}', NULL, 1${scenario === 'conflict' ? ', 99' : ''})`;
+      let sql = `${hook}; ${gap}`;
+      if (scenario === 'ambiguous') {
+        const explicit = gap.replace('(topic,', '(id, topic,').replace("VALUES ('门后信件'", "VALUES ('E1', '门后信件'");
+        sql = `${hook}; ${explicit}; ${explicit}`;
+      }
+      let current = true;
+      if (scenario === 'failed-save') saveChat.mockRejectedValueOnce(new Error('disk failure'));
+      if (scenario === 'stale') saveChat.mockImplementationOnce(async () => { current = false; });
+      if (scenario === 'changed-chat') saveChat.mockImplementationOnce(async () => {
+        _set_SillyTavern_API_ACU({ chat: [{ is_user: false, mes: 'new chat' }], saveChat } as any);
+      });
+      if (scenario === 'changed-swipe') {
+        chat[1].swipe_id = 0;
+        saveChat.mockImplementationOnce(async () => { chat[1].swipe_id = 1; });
+      }
+      try {
+        const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, role, sql,
+          isCurrent: () => current });
+        const issue = receipt.rejected.find(item => item.path === (scenario === 'ambiguous'
+          ? 'infoGap#E1.recent_floor' : 'sql[1].info_gap.recent_floor'))!;
+        expect(issue.reason).toContain('白名单');
+        if (scenario === 'complete' || scenario === 'partial') {
+          expect(receipt.status).toBe('committed');
+          expect(issue.operationOnlyTarget).toEqual({ module: 'infoGap', id: 'E001', expectedRevision: 1 });
+          expect(readAgentModuleFieldSnapshot_ACU(chat).records.infoGap?.E001.status)
+            .toBe(scenario === 'complete' ? 'complete' : 'partial');
+          if (scenario === 'complete') {
+            expect(receipt.operationOnlyConfirmed).toEqual([{ module: 'infoGap', id: 'E001', revision: 1,
+              rejectedPaths: ['sql[1].info_gap.recent_floor'] }]);
+            expect(readAgentModuleSnapshot_ACU(chat).infoGap[0].id).toBe('E001');
+            expect(receipt.partials).toEqual([]);
+          } else {
+            expect(receipt.operationOnlyConfirmed).toBeUndefined();
+            expect(receipt.partials).toEqual([expect.objectContaining({ module: 'infoGap', id: 'E001',
+              missingFields: expect.arrayContaining(['objectiveFact', 'readerKnown', 'characterKnowledge', 'revealStatus']) })]);
+          }
+        } else {
+          expect(issue.operationOnlyTarget).toBeUndefined();
+          expect(receipt.operationOnlyConfirmed).toBeUndefined();
+          if (scenario === 'conflict') expect(receipt.rejected.some(item => item.reason.includes('revision_conflict'))).toBe(true);
+          if (scenario === 'failed-save') expect(receipt.status).toBe('persist_failed');
+          if (['stale', 'changed-chat', 'changed-swipe'].includes(scenario)) expect(receipt.status).toBe('readback_failed');
+        }
+        const { reconcileAgentOperationOnlyPending_ACU } = await import('../../../../src/service/continuation/agent/agent-module-field-commit');
+        const legacy = { module: 'hooks' as const, agentName: role, source: 'transaction_rejected' as const,
+          attempts: 1, firstFailedAtIndex: 1, lastError: '旧诊断',
+          violations: [{ path: 'sql[1].info_gap.recent_floor', message: issue.reason }] };
+        expect(reconcileAgentOperationOnlyPending_ACU([legacy], receipt.operationOnlyConfirmed ?? [])).toEqual([legacy]);
+      } finally { _set_SillyTavern_API_ACU(null as any); }
+    });
+
+
+  it('完整条目退役经领域校验并在保存后回读', async () => {
+    const { chat } = setup();
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: INSERT_PARTIAL, role: 'hook-cognition-maintainer' });
+    await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: UPDATE_REST, role: 'hook-cognition-maintainer' });
+    const receipt = await commitAgentModuleFieldWrites_ACU({ chat, targetIndex: 1, sql: "DELETE FROM hooks WHERE id = 'H1' AND expected_revision = 2 AND reason = '线索终结'", role: 'hook-cognition-maintainer' });
+    expect(receipt.status).toBe('committed');
+    expect(readAgentModuleSnapshot_ACU(chat).hooks[0]).toMatchObject({ retired: true, retiredReason: '线索终结' });
+  });
+
+});

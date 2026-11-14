@@ -1,0 +1,133 @@
+import type { CustomApiFormat_ACU } from '../settings/api-preset-service';
+
+const text = (value: any): string => typeof value === 'string' ? value : Array.isArray(value)
+    ? value.map(part => typeof part === 'string' ? part : part?.text ?? '').join('') : '';
+const args = (value: any): any => typeof value === 'string' ? JSON.parse(value || '{}') : value ?? {};
+
+/** 直连保留消息顺序、身份与工具事务，不读取预设后处理，也不生成伪对话。 */
+export function processDirectMessages_ACU(input: any[]): any[] {
+    return input.map(message => ({ ...message }));
+}
+
+export function providerEndpoint_ACU(raw: string, format: CustomApiFormat_ACU): string {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('API 端点必须是 HTTP 或 HTTPS 地址。');
+    let path = url.pathname.replace(/\/+$/, '').replace(/\/(chat\/completions|responses|messages|interactions)$/, '');
+    if (!path && format !== 'openai_compat' && format !== 'openai_responses') path = format === 'claude_messages' ? '/v1' : '/v1beta';
+    url.pathname = path + ({ openai_compat: '/chat/completions', openai_responses: '/responses', claude_messages: '/messages', gemini_interactions: '/interactions' }[format]);
+    return url.toString();
+}
+
+
+/** 把通用消息转换为协议请求；附加主体参数由发送层在转换后合并。 */
+export function buildProviderRequest_ACU(body: Record<string, any>, format: CustomApiFormat_ACU): Record<string, any> {
+    if (format === 'openai_compat') return { ...body };
+    const { messages, max_tokens, tools, tool_choice, response_format, ...rest } = body;
+    if (format === 'openai_responses') {
+        const input = messages.flatMap((m: any) => {
+            if (m.role === 'tool') return [{ type: 'function_call_output', call_id: m.tool_call_id, output: text(m.content) }];
+            const items: any[] = m.content ? [{ role: m.role, content: m.content }] : [];
+            for (const call of m.tool_calls ?? []) items.push({ type: 'function_call', call_id: call.id, ...call.function });
+            return items;
+        });
+        return { ...rest, input, max_output_tokens: max_tokens,
+            ...(tools?.length ? { tools: tools.map((t: any) => ({ type: 'function', ...t.function })), tool_choice } : {}),
+            ...(response_format ? { text: { format: response_format.type === 'json_schema' ? { type: 'json_schema', ...response_format.json_schema } : response_format } } : {}) };
+    }
+    if (format === 'claude_messages') {
+        const system = messages.filter((m: any) => m.role === 'system').map((m: any) => ({ type: 'text', text: text(m.content) }));
+        const converted = messages.filter((m: any) => m.role !== 'system').map((m: any) => ({
+            role: m.role === 'assistant' ? 'assistant' : 'user',
+            content: m.role === 'tool' ? [{ type: 'tool_result', tool_use_id: m.tool_call_id, content: text(m.content) }]
+                : [...(m.content ? [{ type: 'text', text: text(m.content) }] : []), ...(m.tool_calls ?? []).map((c: any) => ({ type: 'tool_use', id: c.id, name: c.function.name, input: args(c.function.arguments) }))],
+        }));
+        const { top_p, temperature, model, stream } = rest;
+        return { model, stream, temperature, top_p, max_tokens, messages: converted, ...(system.length ? { system } : {}),
+            ...(tools?.length ? { tools: tools.map((t: any) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters })), tool_choice: { type: 'auto' } } : {}),
+            ...(response_format ? { output_config: { format: { type: 'json_schema', schema: response_format.json_schema?.schema ?? { type: 'object' } } } } : {}) };
+    }
+    const input = messages.filter((m: any) => m.role !== 'system').flatMap((m: any) => {
+        if (m.role === 'tool') return [{ type: 'function_result', call_id: m.tool_call_id, result: text(m.content) }];
+        return [...(m.content ? [{ type: m.role === 'assistant' ? 'model_output' : 'user_input', content: [{ type: 'text', text: text(m.content) }] }] : []),
+            ...(m.tool_calls ?? []).map((c: any) => ({ type: 'function_call', id: c.id, name: c.function.name, arguments: args(c.function.arguments) }))];
+    });
+    return { model: rest.model, stream: rest.stream, store: false, input,
+        system_instruction: messages.filter((m: any) => m.role === 'system').map((m: any) => text(m.content)).join('\n\n'),
+        generation_config: { max_output_tokens: max_tokens, ...(tools?.length ? { tool_choice: 'auto' } : {}) },
+        ...(tools?.length ? { tools: tools.map((t: any) => ({ type: 'function', ...t.function })) } : {}),
+        ...(response_format ? { response_format: { type: 'json', schema: response_format.json_schema?.schema ?? { type: 'object' } } } : {}) };
+}
+
+const UPSTREAM_ERROR_MESSAGE_LIMIT_ACU = 300;
+
+/** 只取上游错误对象的 type / code / message，供日志分类与用户排查；原始 wire 已由请求日志完整记录。 */
+export function describeProviderUpstreamError_ACU(data: any): string {
+    const raw = data?.error ?? (Array.isArray(data?.errors) ? data.errors[0] : undefined);
+    const fields: string[] = [];
+    let message = '';
+    if (raw && typeof raw === 'object') {
+        const type = raw.type ?? raw.status;
+        if (typeof type === 'string' || typeof type === 'number') fields.push(`type=${type}`);
+        if (typeof raw.code === 'string' || typeof raw.code === 'number') fields.push(`code=${raw.code}`);
+        if (typeof raw.message === 'string') message = raw.message;
+    } else if (typeof raw === 'string') {
+        message = raw;
+    }
+    if (!raw && typeof data?.status === 'string') fields.push(`status=${data.status}`);
+    const trimmed = message.trim();
+    const shown = trimmed.length > UPSTREAM_ERROR_MESSAGE_LIMIT_ACU ? `${trimmed.slice(0, UPSTREAM_ERROR_MESSAGE_LIMIT_ACU)}…` : trimmed;
+    return `直连 API 返回上游错误${fields.length ? `（${fields.join(', ')}）` : ''}${shown ? `：${shown}` : '。'}`;
+}
+
+/** 原始非流式回复归一到现有 OpenAI 回复契约，原始 wire 另行完整记录。 */
+export function normalizeProviderReply_ACU(data: any, format: CustomApiFormat_ACU): any {
+    if (format === 'openai_compat' || data?.choices) return data;
+    if (data?.error || data?.errors?.length || ['failed', 'cancelled'].includes(data?.status)) throw new Error(describeProviderUpstreamError_ACU(data));
+    const blocks = format === 'claude_messages' ? data.content ?? []
+        : format === 'openai_responses' ? data.output ?? [] : data.steps ?? data.outputs ?? [];
+    const content = blocks.map((b: any) => b.type === 'text' ? b.text : text(b.content)).join('');
+    const calls = blocks.filter((b: any) => ['function_call', 'tool_use'].includes(b.type)).map((b: any) => ({
+        id: b.call_id ?? b.id, type: 'function', function: { name: b.name, arguments: typeof b.arguments === 'string' ? b.arguments : JSON.stringify(b.arguments ?? b.input ?? {}) },
+    }));
+    const usage = data.usage;
+    return { choices: [{ message: { role: 'assistant', content, ...(calls.length ? { tool_calls: calls } : {}) },
+        finish_reason: calls.length ? 'tool_calls' : (data.stop_reason === 'max_tokens' || data.status === 'incomplete' ? 'length'
+            : format === 'claude_messages' ? (['end_turn', 'stop_sequence'].includes(data.stop_reason) ? 'stop' : null)
+            : data.status === 'completed' ? 'stop' : null) }],
+        usage: usage ? { ...usage, prompt_tokens: usage.input_tokens ?? usage.total_input_tokens, completion_tokens: usage.output_tokens ?? usage.total_output_tokens } : undefined };
+}
+
+/** Responses / Interactions SSE 转为现有消费者使用的 Chat Completion SSE；不伪造缺失的终态。 */
+export function normalizeProviderStream_ACU(raw: string, format: CustomApiFormat_ACU): string {
+    if (format === 'openai_compat' || format === 'claude_messages') return raw;
+    const packets: string[] = [];
+    const emit = (delta: any, finish_reason: string | null = null, usage?: any) => packets.push(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason }], ...(usage ? { usage } : {}) })}\n\n`);
+    let completed = false;
+    for (const event of raw.replace(/\r\n/g, '\n').split('\n\n')) {
+        const data = event.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+        if (!data) continue;
+        if (data === '[DONE]') { completed = true; continue; }
+        const json = JSON.parse(data);
+        if (json.error || json.type === 'error' || json.type === 'response.failed' || json.event_type === 'error') throw new Error('直连 API 流返回上游错误。');
+        if (format === 'openai_responses') {
+            if (json.type === 'response.output_text.delta') emit({ content: json.delta });
+            if (json.type === 'response.output_item.added' && json.item?.type === 'function_call') emit({ tool_calls: [{ index: json.output_index ?? 0, id: json.item.call_id ?? json.item.id, type: 'function', function: { name: json.item.name, arguments: '' } }] });
+            if (json.type === 'response.function_call_arguments.delta') emit({ tool_calls: [{ index: json.output_index ?? 0, function: { arguments: json.delta } }] });
+            if (json.type === 'response.completed' || json.type === 'response.incomplete') {
+                const reply = normalizeProviderReply_ACU(json.response, format);
+                emit({}, reply.choices[0].finish_reason, reply.usage); completed = true;
+            }
+        } else {
+            const type = json.event_type ?? json.type;
+            if (type === 'content.delta' && json.delta?.type === 'text') emit({ content: json.delta.text ?? '' });
+            if (type === 'step.delta' && json.delta?.type === 'text') emit({ content: json.delta.text ?? '' });
+            if (type === 'content.start' && json.content?.type === 'function_call') emit({ tool_calls: [{ index: json.index ?? 0, id: json.content.id, type: 'function', function: { name: json.content.name, arguments: JSON.stringify(json.content.arguments ?? {}) } }] });
+            if (type === 'interaction.complete' || type === 'interaction.completed') {
+                const reply = normalizeProviderReply_ACU(json.interaction ?? json, format);
+                emit({}, reply.choices[0].finish_reason, reply.usage); completed = true;
+            }
+        }
+    }
+    if (completed) packets.push('data: [DONE]\n\n');
+    return packets.join('');
+}

@@ -1,0 +1,710 @@
+import { computed, ref, type ComputedRef, type Ref } from 'vue';
+import {
+  settings_ACU,
+  abortAllActiveRequests_ACU,
+  _set_isAutoUpdatingCard_ACU,
+  _set_manualExtraHint_ACU,
+  _set_wasStoppedByUser_ACU,
+  getCurrentIsolationKey_ACU,
+} from '../../service/runtime/state-manager';
+import { getChatArray_ACU } from '../../service/chat/chat-service';
+import { saveSettings_ACU } from '../../service/settings/settings-service';
+import {
+  getCurrentTableDisplayData_ACU,
+  getCurrentWorldbookConfig_ACU,
+  hasRuntimeTableData_ACU,
+} from '../../service/settings/settings-readers';
+import { getSortedSheetKeys_ACU } from '../../service/template/chat-scope';
+import { collectV2CheckpointFloorsFromChat_ACU } from '../../service/table/table-history';
+import {
+  orchestrateManualCatchUp_ACU,
+  prepareManualCatchUpPlan_ACU,
+  type CardUpdateProgressEvent,
+} from '../../service/table/update-orchestrator';
+import { resolveManualUpdateBatchSize_ACU, resolveManualUpdateContextDepth_ACU } from '../../service/table/manual-update-settings';
+import { refreshMergedDataAndNotify_ACU } from '../../service/worldbook/pipeline';
+import { getCurrentCharPrimaryLorebook_ACU } from '../../service/worldbook/worldbook-service';
+import { topLevelWindow_ACU } from '../../shared/env';
+import { getNoticeHubSnapshot_ACU } from '../../shared/notice-hub';
+import { useDialogStore } from '../stores/dialog-store';
+import { useToastStore } from '../stores/toast-store';
+
+type MessageKind = 'info' | 'success' | 'warning' | 'error';
+
+/** 气泡与桌宠里显示的功能名。 */
+const MANUAL_UPDATE_TASK_FEATURE = '手动填表';
+const CATCH_UP_TASK_FEATURE = '手动追平';
+
+/** 宿主世界书 API 挂起时确认弹窗不能被无限期拖住，超过该时长即降级为提示文案。 */
+const INJECTION_TARGET_RESOLVE_TIMEOUT_MS = 1500;
+const RESOLVE_TIMEOUT: unique symbol = Symbol('injection-target-resolve-timeout');
+
+/**
+ * 确认弹窗用的世界书注入目标描述：大规模历史回填会一次生成上百条 TavernDB 条目，
+ * 用户必须在确认前看到它们将写入哪本世界书（默认是角色卡绑定的主世界书，而不是
+ * 用户新建的外挂数据库世界书）。解析失败或超时不阻断确认流程，只降级为提示文案。
+ */
+async function describeInjectionTargetForConfirm(): Promise<string> {
+  const target = String(getCurrentWorldbookConfig_ACU()?.injectionTarget || '').trim() || 'character';
+  if (target !== 'character') return target;
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const primary = await Promise.race<string | null | typeof RESOLVE_TIMEOUT>([
+      getCurrentCharPrimaryLorebook_ACU(),
+      new Promise<typeof RESOLVE_TIMEOUT>(resolve => {
+        timeoutHandle = setTimeout(() => resolve(RESOLVE_TIMEOUT), INJECTION_TARGET_RESOLVE_TIMEOUT_MS);
+      }),
+    ]);
+    if (primary === RESOLVE_TIMEOUT) return '角色卡绑定世界书（主世界书解析超时）';
+    return primary ? `角色卡绑定世界书 · ${primary}` : '角色卡绑定世界书（未解析到主世界书）';
+  } catch {
+    return '角色卡绑定世界书（未解析到主世界书）';
+  } finally {
+    if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+  }
+}
+
+export interface ManualUpdateState {
+  selectedManualTableKeys: Ref<string[]>;
+  manualContextDepth: Ref<number>;
+  manualBatchSize: Ref<number>;
+  manualExtraHint: Ref<string>;
+  manualUpdateBusy: Ref<boolean>;
+  catchUpBusy: Ref<boolean>;
+  sheetKeys: ComputedRef<string[]>;
+  sheetNames: ComputedRef<Record<string, string>>;
+  /** runtime 是否已持有真实表格数据；false（如 purge 后）时展示层仅展示模板，选择器应禁用 */
+  runtimeReady: ComputedRef<boolean>;
+  selectedSheetSummary: ComputedRef<string>;
+  checkpointFloorsLabel: ComputedRef<string>;
+  manualRefillRangeLabel: ComputedRef<string>;
+  checkpointRiskMessage: ComputedRef<string>;
+  vectorIndexWarning: ComputedRef<boolean>;
+  refresh: () => void;
+  setManualContextDepth: (value: number | string) => void;
+  setManualBatchSize: (value: number | string) => void;
+  setManualSelectedKeys: (keys: string[]) => void;
+  selectAllManualTables: () => void;
+  selectNoManualTables: () => void;
+  runManualUpdate: () => Promise<void>;
+  runManualCatchUp: () => Promise<void>;
+}
+
+function currentSheetKeys(): string[] {
+  try {
+    return getSortedSheetKeys_ACU(getCurrentTableDisplayData_ACU() || {});
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 执行用表键：仅 runtime 真实表。
+ * runtime 未就绪（purge 后为 null / 空）时返回 []，避免把模板表
+ * 当作可执行数据传给 orchestrator。
+ */
+function runtimeExecutionSheetKeys(): string[] {
+  if (!hasRuntimeTableData_ACU()) return [];
+  try {
+    return getSortedSheetKeys_ACU(getCurrentTableDisplayData_ACU() || {});
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * TOCTOU 执行边界校验：确认后重新读取 runtime，
+ * 要求当前 runtime 表集合与确认前快照完全一致，且快照目标仍全部有效。
+ * 任一变化（purge、表删除、新增表、外部直接写 Ref 篡改选择）都会 fail-closed 阻断，
+ * 避免在确认文案与最终执行目标不一致的情况下继续破坏性操作。
+ */
+function runtimeTargetsStillMatch(snapshotKeys: string[], requestedKeys: string[]): boolean {
+  if (!requestedKeys.length || !hasRuntimeTableData_ACU()) return false;
+  const currentKeys = runtimeExecutionSheetKeys();
+  if (currentKeys.length !== snapshotKeys.length) return false;
+  const snapshotSet = new Set(snapshotKeys);
+  if (!currentKeys.every((key) => snapshotSet.has(key))) return false;
+  return requestedKeys.every((key) => snapshotSet.has(key));
+}
+
+function resolveManualSelection(keys: string[]): string[] {
+  if (!keys.length) return [];
+  const saved = Array.isArray(settings_ACU.manualSelectedTables) ? settings_ACU.manualSelectedTables : [];
+  if (settings_ACU.hasManualSelection !== true) return keys.slice();
+  const valid = new Set(keys);
+  return saved.filter((key: string) => valid.has(key));
+}
+
+function saveManualSelection(keys: string[]): void {
+  // runtime 未就绪（如 purge 后）时禁止写入手动选表配置：
+  // 此时展示的是模板表，若把空选择写回会永久覆盖用户原有选表偏好
+  // （hasManualSelection=true + manualSelectedTables=[]），待 runtime 恢复后
+  // resolveManualSelection 会错误地继续返回空数组。必须 fail-closed 保持原状态。
+  if (!hasRuntimeTableData_ACU()) return;
+  const valid = new Set(runtimeExecutionSheetKeys());
+  settings_ACU.manualSelectedTables = keys.filter(key => valid.has(key));
+  settings_ACU.hasManualSelection = true;
+  saveSettings_ACU();
+}
+
+function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.floor(n);
+}
+
+function normalizePositiveInteger(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.floor(n);
+}
+
+// 手动面板的层数/分批参数由 service 层统一解析：手动更新与一键追平都读同一处，
+// 不再在 UI 侧临时改写自动填表的全局设置来“桥接”。
+const resolveManualContextDepth = resolveManualUpdateContextDepth_ACU;
+const resolveManualBatchSize = resolveManualUpdateBatchSize_ACU;
+
+interface ManualRefillRangeSummary {
+  indices: number[];
+  startAiFloor: number;
+  endAiFloor: number;
+}
+
+function resolveManualRefillRangeSummary_ACU(manualDepth: number): ManualRefillRangeSummary | null {
+  const chat = getChatArray_ACU();
+  if (!Array.isArray(chat) || chat.length === 0) return null;
+  const aiItems = chat
+    .map((msg: any, index: number) => (msg && !msg.is_user ? { index, aiFloor: 0 } : null))
+    .filter((item): item is { index: number; aiFloor: number } => item !== null);
+  aiItems.forEach((item, idx) => { item.aiFloor = idx + 1; });
+  const skip = normalizeNonNegativeInteger(settings_ACU.skipUpdateFloors, 0);
+  const effectiveAiItems = skip > 0 ? aiItems.slice(0, -skip) : aiItems.slice();
+  const contextItems = manualDepth > 0 ? effectiveAiItems.slice(-manualDepth) : effectiveAiItems;
+  if (!contextItems.length) return null;
+  return {
+    indices: contextItems.map(item => item.index),
+    startAiFloor: contextItems[0].aiFloor,
+    endAiFloor: contextItems[contextItems.length - 1].aiFloor,
+  };
+}
+
+function formatAiFloorRange_ACU(startAiFloor: number, endAiFloor: number): string {
+  return startAiFloor === endAiFloor
+    ? `第 ${startAiFloor} 条 AI 回复`
+    : `第 ${startAiFloor}~${endAiFloor} 条 AI 回复`;
+}
+
+function progressLabel(event: CardUpdateProgressEvent): string {
+  const prefix = event.currentBatch && event.totalBatches
+    ? `批次 ${event.currentBatch}/${event.totalBatches} · `
+    : '';
+  if (event.message && event.phase !== 'retry' && event.phase !== 'error') {
+    return `${prefix}${normalizeManualProgressMessage(event.message)}`;
+  }
+  switch (event.phase) {
+    case 'preparing': return `${prefix}准备上下文`;
+    case 'calling_ai': return `${prefix}调用 AI${event.attempt ? `（第 ${event.attempt}/${event.maxRetries || '?'} 次尝试）` : ''}`;
+    case 'parsing': return `${prefix}解析填表结果`;
+    case 'saving': return `${prefix}保存表格数据`;
+    case 'retry': return `${prefix}重试中${event.message ? `:${event.message}` : ''}`;
+    case 'complete': return `${prefix}完成`;
+    case 'chunk_done': return `${prefix}分块完成`;
+    case 'error': return `${prefix}出错${event.message ? `:${event.message}` : ''}`;
+    default: return prefix || '处理中';
+  }
+}
+
+function normalizeManualProgressMessage(message: string): string {
+  return message
+    .split(' AI 响应').join('手动填表结果')
+    .split('AI 响应').join('手动填表结果');
+}
+
+export function useManualUpdate(): ManualUpdateState {
+  const dialogStore = useDialogStore();
+  const toast = useToastStore();
+  const selectedManualTableKeys = ref<string[]>(resolveManualSelection(runtimeExecutionSheetKeys()));
+  const manualContextDepth = ref(resolveManualContextDepth());
+  const manualBatchSize = ref(resolveManualBatchSize());
+  const manualExtraHint = ref('');
+  const manualUpdateBusy = ref(false);
+  const catchUpBusy = ref(false);
+  const refreshTick = ref(0);
+  let progressToastId: string | null = null;
+  let abortRequested = false;
+  let catchUpAbortController: AbortController | null = null;
+
+  function progressToastOptions(onAbort: () => void = requestAbort) {
+    const isCatchUp = onAbort === requestCatchUpAbort;
+    const abortDisabled = isCatchUp
+      ? catchUpAbortController?.signal.aborted === true
+      : abortRequested;
+    return {
+      durationMs: 0,
+      muteable: false,
+      dismissible: false,
+      feature: isCatchUp ? CATCH_UP_TASK_FEATURE : MANUAL_UPDATE_TASK_FEATURE,
+      action: abortDisabled
+        ? undefined
+        : {
+            label: '终止',
+            variant: 'danger' as const,
+            dismissOnClick: false,
+            onClick: onAbort,
+          },
+    };
+  }
+
+  function notifyProgress(text: string, onAbort: () => void = requestAbort): void {
+    if (progressToastId && toast.update(progressToastId, 'info', text, progressToastOptions(onAbort))) {
+      return;
+    }
+    progressToastId = toast.info(text, progressToastOptions(onAbort));
+  }
+
+  function finishToast(kind: MessageKind, text: string): void {
+    if (progressToastId) {
+      if (toast.update(progressToastId, kind, text, { muteable: false })) {
+        progressToastId = null;
+        return;
+      }
+      progressToastId = null;
+    }
+    toast[kind](text, { muteable: false });
+  }
+
+  function requestAbort(): void {
+    if (abortRequested) return;
+    abortRequested = true;
+    _set_wasStoppedByUser_ACU(true);
+    abortAllActiveRequests_ACU();
+    _set_isAutoUpdatingCard_ACU(false);
+    // 终止后改为一次性提示：常驻任务只能等编排器返回才关闭，收尾慢或卡住时气泡会一直停留。
+    // 最终结果由 finishToast 另发；manualUpdateBusy 仍保持到编排器真正返回。
+    const text = '手动填表已终止，正在停止当前任务与后续批次...';
+    const options = { muteable: false };
+    if (progressToastId && toast.update(progressToastId, 'warning', text, options)) {
+      progressToastId = null;
+      return;
+    }
+    progressToastId = null;
+    toast.warning(text, options);
+  }
+
+  function requestCatchUpAbort(): void {
+    if (!catchUpAbortController || catchUpAbortController.signal.aborted) return;
+    catchUpAbortController.abort();
+    const text = '追平已停止，正在保存已经写好的内容…';
+    const options = { durationMs: 0, muteable: false, dismissible: false, feature: CATCH_UP_TASK_FEATURE };
+    if (progressToastId) {
+      toast.update(progressToastId, 'warning', text, options);
+    } else {
+      toast.warning(text, options);
+    }
+  }
+
+  const sheetKeys = computed(() => {
+    void refreshTick.value;
+    return currentSheetKeys();
+  });
+
+  /** runtime 就绪判据：仅真实表存在时选择器才允许交互 */
+  const runtimeReady = computed<boolean>(() => {
+    void refreshTick.value;
+    return hasRuntimeTableData_ACU();
+  });
+
+  const sheetNames = computed<Record<string, string>>(() => {
+    const displayData = getCurrentTableDisplayData_ACU() || {};
+    const names: Record<string, string> = {};
+    for (const key of sheetKeys.value) {
+      names[key] = String(displayData[key]?.name || key);
+    }
+    return names;
+  });
+
+  const selectedSheetSummary = computed<string>(() => {
+    const keys = selectedManualTableKeys.value;
+    if (!keys.length) return '未选择表格';
+    const names = sheetNames.value;
+    return keys
+      .map(key => `${names[key] || key}（${key}）`)
+      .join('、');
+  });
+
+  const checkpointFloors = computed(() => {
+    void refreshTick.value;
+    try {
+      return collectV2CheckpointFloorsFromChat_ACU(getChatArray_ACU(), getCurrentIsolationKey_ACU());
+    } catch {
+      return [];
+    }
+  });
+
+  function formatCheckpointReasonLabel(reason?: string): string {
+    switch (reason) {
+      case 'init':
+        return '初始';
+      case 'migration':
+        return '迁移';
+      case 'compaction':
+        return '自动整理';
+      case 'manual':
+        return '手动';
+      case 'periodic':
+        return '定期';
+      default:
+        return '旧记录';
+    }
+  }
+
+  const checkpointFloorsLabel = computed<string>(() => {
+    const checkpoints = checkpointFloors.value;
+    return checkpoints.length > 0
+      ? checkpoints
+        .map(item => `第 ${item.aiFloor} 条 AI 回复（${formatCheckpointReasonLabel(item.reason)}）`)
+        .join('、')
+      : '还没有记录过进度';
+  });
+
+  const manualRefillRange = computed<ManualRefillRangeSummary | null>(() => {
+    void refreshTick.value;
+    try {
+      return resolveManualRefillRangeSummary_ACU(manualContextDepth.value);
+    } catch {
+      return null;
+    }
+  });
+
+  const manualRefillRangeLabel = computed<string>(() => {
+    const range = manualRefillRange.value;
+    return range
+      ? formatAiFloorRange_ACU(range.startAiFloor, range.endAiFloor)
+      : '暂无可重填的 AI 回复';
+  });
+
+  const checkpointRiskMessage = computed<string>(() => {
+    const checkpoints = checkpointFloors.value;
+    const range = manualRefillRange.value;
+    if (checkpoints.length === 0 || !range) return '';
+    const checkpointIndexSet = new Set(range.indices);
+    const coveredCheckpoints = checkpoints.filter(item => checkpointIndexSet.has(item.messageIndex));
+    if (coveredCheckpoints.length !== checkpoints.length) return '';
+    const coveredFloors = coveredCheckpoints.map(item => `第 ${item.aiFloor} 条 AI 回复`).join('、');
+    return `危险：本次重填会覆盖当前聊天里所有存档进度（${coveredFloors}）。系统会先做安全检查；如果确认缺少重填起点之前的存档，会再单独询问你是否替换这些表的数据基础。`;
+  });
+
+  /** 本次重填范围是否会覆盖（删除并重建）任一 full checkpoint；不覆盖时静默执行。 */
+  const refillRangeCoversCheckpoint = computed<boolean>(() => {
+    const range = manualRefillRange.value;
+    if (!range) return false;
+    const rangeIndexSet = new Set(range.indices);
+    return checkpointFloors.value.some(item => rangeIndexSet.has(item.messageIndex));
+  });
+
+  const vectorIndexWarning = computed<boolean>(() => {
+    void refreshTick.value;
+    try {
+      return getCurrentWorldbookConfig_ACU().summaryVectorIndexModeEnabled === true;
+    } catch {
+      return false;
+    }
+  });
+
+  function refresh(): void {
+    selectedManualTableKeys.value = resolveManualSelection(runtimeExecutionSheetKeys());
+    manualContextDepth.value = resolveManualContextDepth();
+    manualBatchSize.value = resolveManualBatchSize();
+    refreshTick.value++;
+  }
+
+  function setManualContextDepth(value: number | string): void {
+    const normalized = normalizeNonNegativeInteger(value, manualContextDepth.value);
+    manualContextDepth.value = normalized;
+    settings_ACU.manualUpdateContextDepth = normalized;
+    saveSettings_ACU();
+  }
+
+  function setManualBatchSize(value: number | string): void {
+    const normalized = normalizePositiveInteger(value, manualBatchSize.value);
+    manualBatchSize.value = normalized;
+    settings_ACU.manualUpdateBatchSize = normalized;
+    saveSettings_ACU();
+  }
+
+  function setManualSelectedKeys(keys: string[]): void {
+    const valid = new Set(runtimeExecutionSheetKeys());
+    selectedManualTableKeys.value = keys.filter((key) => valid.has(key));
+    saveManualSelection(selectedManualTableKeys.value);
+    refreshTick.value++;
+  }
+
+  function selectAllManualTables(): void {
+    setManualSelectedKeys(runtimeExecutionSheetKeys());
+  }
+
+  function selectNoManualTables(): void {
+    setManualSelectedKeys([]);
+  }
+
+  async function runManualUpdate(): Promise<void> {
+    // 手动填表改为「不覆盖」：与一键追平同一套缺口补齐逻辑，
+    // 从每张表最后一个有记录的楼层之后继续填，绝不删除/重建已有数据。
+    if (manualUpdateBusy.value || catchUpBusy.value) return;
+    if (!selectedManualTableKeys.value.length) {
+      toast.warning('未选择需要手动填表的表格。');
+      return;
+    }
+    const requestedTargetKeys = selectedManualTableKeys.value.slice();
+    const snapshotRuntimeKeys = runtimeExecutionSheetKeys();
+    const runtimeKeys = new Set(snapshotRuntimeKeys);
+    const validTargetKeys = requestedTargetKeys.filter((key) => runtimeKeys.has(key));
+    if (!snapshotRuntimeKeys.length || validTargetKeys.length !== requestedTargetKeys.length) {
+      toast.warning('当前表格运行时未就绪，无法执行手动填表。');
+      return;
+    }
+
+    manualUpdateBusy.value = true;
+    try {
+      // 用一键追平的规划器：只补「最后有记录楼层」之后到最新的缺口，不覆盖。
+      const planningResult = await prepareManualCatchUpPlan_ACU(requestedTargetKeys);
+      if (!planningResult.success || !planningResult.plan) {
+        finishToast('error', planningResult.error || '没法生成补填计划，请稍后再试。');
+        return;
+      }
+      const plan = planningResult.plan;
+      if (!plan.waves.length) {
+        finishToast('info', '所选表都已经是最新的，不用再补了。');
+        return;
+      }
+      const waveSummary = plan.waves.map((wave, index) =>
+        `第 ${index + 1} 批：${formatAiFloorRange_ACU(wave.startAiFloor, wave.endAiFloor)}；${wave.sheetKeys.map(key => sheetNames.value[key] || key).join('、')}`
+      ).join('\n');
+      const skipFloors = normalizeNonNegativeInteger(settings_ACU.skipUpdateFloors, 0);
+      const skipLine = skipFloors > 0 ? `跳过最新 ${skipFloors} 条 AI 回复（最新的先不补）。\n` : '';
+      const confirmed = await dialogStore.confirm({
+        title: '手动填表（不覆盖）',
+        message: `会补齐所选表还没填的内容，不会覆盖/删除已有数据。\n目标：补到第 ${plan.targetAiFloor} 条 AI 回复\n会分 ${plan.waves.length} 批处理。\n${skipLine}\n${waveSummary}\n\n只会补每张表上次填完之后的新内容，不会回头修改已经填好的部分。\n开始前会再核对一次表格状态；如果发现表格有变化、可能影响已填内容，会在开始前停下，不会改动任何数据。`,
+        confirmLabel: '开始填表',
+        cancelLabel: '取消',
+      });
+      if (!confirmed) return;
+      if (getNoticeHubSnapshot_ACU().tasks.some(task => task.busy && task.feature === MANUAL_UPDATE_TASK_FEATURE)) {
+        toast.warning('已经有一次填表在进行中，等它结束再试。');
+        return;
+      }
+      if (!runtimeTargetsStillMatch(snapshotRuntimeKeys, requestedTargetKeys)) {
+        finishToast('warning', '确认期间表格有变化，这次填表已取消，请重新确认要填的表。');
+        return;
+      }
+      progressToastId = null;
+      abortRequested = false;
+      catchUpAbortController = new AbortController();
+      notifyProgress('开始补齐还没填的内容…', requestCatchUpAbort);
+      const extra = manualExtraHint.value.trim();
+      if (extra) _set_manualExtraHint_ACU(`以下为用户的额外填表要求,请严格遵守:\n${extra}`);
+      const result = await orchestrateManualCatchUp_ACU(
+        requestedTargetKeys,
+        refreshMergedDataAndNotify_ACU,
+        {
+          abortController: catchUpAbortController,
+          onProgress: event => notifyProgress(progressLabel(event), requestCatchUpAbort),
+          executionSnapshot: { sheetKeys: snapshotRuntimeKeys },
+        },
+      );
+      if (result.dataCommitted === true) {
+        try { (topLevelWindow_ACU as any).AutoCardUpdaterAPI?._notifyTableUpdate?.(); } catch (_) {}
+      }
+      if (result.outcome === 'sync_pending') {
+        showCatchUpSyncPending();
+      } else if (result.outcome === 'no_work') {
+        finishToast('info', '所选表都已经是最新的，不用再补了。');
+      } else if (result.outcome === 'progress_metadata_failed') {
+        finishToast('warning', '内容已经写入表格，但进度记录没保存成功。这不影响已填的内容，下次补填时会先把进度补记上，不会重填这次写好的部分。');
+      } else if (result.outcome === 'integrity_failed') {
+        finishToast('error', '写入后发现数据不一致，已经恢复成聊天里上次保存的内容。可以到「数据管理」里做一次数据恢复检查。');
+      } else if (result.outcome === 'blocked') {
+        finishToast('error', '为了不覆盖已有内容，这次填表在开始前停下了。可以先到「数据管理」里的数据恢复检查看一下。');
+      } else if (result.outcome === 'stopped' || catchUpAbortController.signal.aborted) {
+        finishToast('warning', `填表已停止；已经写好的 ${result.committedBucketCount || 0} 段保留了。`);
+      } else if (result.success) {
+        finishToast('success', `填表完成，共写入 ${result.committedBucketCount || 0} 段。`);
+      } else {
+        finishToast('error', '填表没有完成，请稍后再试。');
+      }
+    } catch (error: any) {
+      finishToast('error', error?.message || '手动填表执行异常。');
+    } finally {
+      catchUpAbortController = null;
+      manualUpdateBusy.value = false;
+      refresh();
+    }
+  }
+
+  async function retryCatchUpSyncOnly(): Promise<void> {
+    if (manualUpdateBusy.value || catchUpBusy.value) return;
+    catchUpBusy.value = true;
+    try {
+      if (progressToastId) {
+        toast.update(progressToastId, 'info', '正在仅重试世界书同步，不会再次调用 AI...', {
+          durationMs: 0,
+          muteable: false,
+          dismissible: false,
+        });
+      }
+      const result = await refreshMergedDataAndNotify_ACU();
+      refresh();
+      if (result.degraded) {
+        showCatchUpSyncPending();
+        return;
+      }
+      finishToast('success', '世界书同步已完成；没有再次调用 AI。');
+    } catch (error: any) {
+      showCatchUpSyncPending(error?.message || '世界书同步仍未完成。');
+    } finally {
+      catchUpBusy.value = false;
+    }
+  }
+
+  function showCatchUpSyncPending(detail?: string): void {
+    const text = `补填的数据已保存，但世界书还没同步好。${detail ? ` ${detail}` : ''}`;
+    const options = {
+      durationMs: 0,
+      muteable: false,
+      dismissible: true,
+      feature: CATCH_UP_TASK_FEATURE,
+      // 待用户重试的常驻提示，不代表正在干活。
+      busy: false,
+      action: {
+        label: '仅同步重试',
+        dismissOnClick: false,
+        onClick: retryCatchUpSyncOnly,
+      },
+    };
+    if (progressToastId && toast.update(progressToastId, 'warning', text, options)) return;
+    progressToastId = toast.warning(text, options);
+  }
+
+  async function runManualCatchUp(): Promise<void> {
+    if (manualUpdateBusy.value || catchUpBusy.value) return;
+    // 空选择优先于 runtime 状态判断：保持原有提示，避免误报“运行时未就绪”。
+    if (!selectedManualTableKeys.value.length) {
+      toast.warning('请先选择要补填的表格。');
+      return;
+    }
+    // 执行边界校验（确认前）：追平同样绝不允许把模板表当作执行目标。
+    // 弹确认框前建立不可变快照：确认文案与最终执行目标必须来自同一快照。
+    const requestedTargetKeys = selectedManualTableKeys.value.slice();
+    const snapshotRuntimeKeys = runtimeExecutionSheetKeys();
+    const runtimeKeys = new Set(snapshotRuntimeKeys);
+    const validTargetKeys = requestedTargetKeys.filter((key) => runtimeKeys.has(key));
+    if (!snapshotRuntimeKeys.length || validTargetKeys.length !== requestedTargetKeys.length) {
+      toast.warning('表格还没准备好，暂时不能补填；等聊天里的表格加载完再试。');
+      return;
+    }
+
+    catchUpBusy.value = true;
+    try {
+      const planningResult = await prepareManualCatchUpPlan_ACU(requestedTargetKeys);
+      if (!planningResult.success || !planningResult.plan) {
+        finishToast('error', planningResult.error || '没法生成补填计划，请稍后再试。');
+        return;
+      }
+      const plan = planningResult.plan;
+      if (!plan.waves.length) {
+        finishToast('info', '所选表都已经是最新的，不用再补了。');
+        return;
+      }
+      const waveSummary = plan.waves.map((wave, index) =>
+        `第 ${index + 1} 批：${formatAiFloorRange_ACU(wave.startAiFloor, wave.endAiFloor)}；${wave.sheetKeys.map(key => sheetNames.value[key] || key).join('、')}`
+      ).join('\n');
+      const skipFloors = normalizeNonNegativeInteger(settings_ACU.skipUpdateFloors, 0);
+      const skipLine = skipFloors > 0 ? `跳过最新 ${skipFloors} 条 AI 回复（最新的先不补）。\n` : '';
+      const confirmed = await dialogStore.confirm({
+        title: '一键追平还没填的内容',
+        message: `会补齐所选表还没填的内容。\n目标：补到第 ${plan.targetAiFloor} 条 AI 回复\n会分 ${plan.waves.length} 批处理。\n${skipLine}\n${waveSummary}\n\n只会补每张表上次填完之后的新内容，不会回头修改已经填好的部分。\n开始前会再核对一次表格状态；如果发现表格有变化、可能影响已填内容，会在开始前停下，不会改动任何数据。`,
+        confirmLabel: '开始追平',
+        cancelLabel: '取消',
+      });
+      if (!confirmed) return;
+      if (getNoticeHubSnapshot_ACU().tasks.some(task => task.busy && task.feature === CATCH_UP_TASK_FEATURE)) {
+        toast.warning('已经有一次补填在进行中，等它结束再试。');
+        return;
+      }
+
+      // 确认后 TOCTOU 复检：确认期间 runtime 可能被 purge/表删除/新增表改变。
+      // 追平计划基于确认前快照生成，若当前 runtime 表集合与快照不一致，
+      // 必须重新规划并要求用户重新确认，避免“确认的计划”与“执行的目标”不一致。
+      if (!runtimeTargetsStillMatch(snapshotRuntimeKeys, requestedTargetKeys)) {
+        finishToast('warning', '确认期间表格有变化，这次追平已取消，请重新确认要补的表。');
+        return;
+      }
+      progressToastId = null;
+      abortRequested = false;
+      catchUpAbortController = new AbortController();
+      notifyProgress('开始补齐还没填的内容…', requestCatchUpAbort);
+      const result = await orchestrateManualCatchUp_ACU(
+        requestedTargetKeys,
+        refreshMergedDataAndNotify_ACU,
+        {
+          abortController: catchUpAbortController,
+          onProgress: event => notifyProgress(progressLabel(event), requestCatchUpAbort),
+          // 把确认前快照传给 service 层：orchestrator 内部会再次校验 runtime 一致性，
+          // 使 TOCTOU 防护延伸到 UI 复检之后的异步窗口。
+          executionSnapshot: { sheetKeys: snapshotRuntimeKeys },
+        },
+      );
+      if (result.dataCommitted === true) {
+        try { (topLevelWindow_ACU as any).AutoCardUpdaterAPI?._notifyTableUpdate?.(); } catch (_) {}
+      }
+      if (result.outcome === 'sync_pending') {
+        showCatchUpSyncPending();
+      } else if (result.outcome === 'no_work') {
+        finishToast('info', '所选表都已经是最新的，不用再补了。');
+      } else if (result.outcome === 'progress_metadata_failed') {
+        finishToast('warning', '内容已经写入表格，但进度记录没保存成功。这不影响已填的内容，下次补填时会先把进度补记上，不会重填这次写好的部分。');
+      } else if (result.outcome === 'integrity_failed') {
+        finishToast('error', '写入后发现数据不一致，已经恢复成聊天里上次保存的内容。可以到「数据管理」里做一次数据恢复检查。详细信息可在运行日志里查看。');
+      } else if (result.outcome === 'blocked') {
+        finishToast('error', '为了不覆盖已有内容，这次追平在开始前停下了。可以先到「数据管理」里的数据恢复检查看一下。');
+      } else if (result.outcome === 'stopped' || catchUpAbortController.signal.aborted) {
+        finishToast('warning', `追平已停止；已经写好的 ${result.committedBucketCount || 0} 段保留了。`);
+      } else if (result.success) {
+        finishToast('success', `追平完成，共写入 ${result.committedBucketCount || 0} 段。`);
+      } else {
+        finishToast('error', '追平没有完成，请稍后再试。');
+      }
+    } catch {
+      finishToast('error', '追平过程中出错了，请稍后再试。');
+    } finally {
+      catchUpAbortController = null;
+      catchUpBusy.value = false;
+      refresh();
+    }
+  }
+
+  return {
+    selectedManualTableKeys,
+    manualContextDepth,
+    manualBatchSize,
+    manualExtraHint,
+    manualUpdateBusy,
+    catchUpBusy,
+    sheetKeys,
+    sheetNames,
+    runtimeReady,
+    selectedSheetSummary,
+    checkpointFloorsLabel,
+    manualRefillRangeLabel,
+    checkpointRiskMessage,
+    vectorIndexWarning,
+    refresh,
+    setManualContextDepth,
+    setManualBatchSize,
+    setManualSelectedKeys,
+    selectAllManualTables,
+    selectNoManualTables,
+    runManualUpdate,
+    runManualCatchUp,
+  };
+}
